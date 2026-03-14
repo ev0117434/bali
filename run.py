@@ -3,13 +3,14 @@
 Market Data Collector — единая точка запуска.
 
 Запускает все 6 скриптов как дочерние процессы, пишет их stdout/stderr
-в общий лог с префиксом имени скрипта. При получении SIGTERM/SIGINT
-корректно останавливает все дочерние процессы.
+в общий лог с префиксом имени скрипта и в отдельные файлы в logs/.
+При получении SIGTERM/SIGINT корректно останавливает все дочерние процессы.
 
 Использование:
     python3 run.py
     python3 run.py --only binance_spot bybit_spot   # запустить выборочно
     python3 run.py --no-monitors                    # без stale/latency мониторов
+    python3 run.py --logs-dir /var/log/market-data  # своя папка для логов
 """
 import argparse
 import os
@@ -18,8 +19,16 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
+from logging.handlers import RotatingFileHandler
+import logging
 
 MARKET_DATA_DIR = os.path.join(os.path.dirname(__file__), "market-data")
+LOGS_DIR = os.path.join(os.path.dirname(__file__), "logs")
+
+# Ротация: 50 МБ на файл, 5 архивов → макс 300 МБ на скрипт
+LOG_MAX_BYTES = 50 * 1024 * 1024
+LOG_BACKUP_COUNT = 5
 
 SCRIPTS = [
     "binance_spot",
@@ -51,8 +60,26 @@ def colorize(name: str, text: str) -> str:
     return f"{COLORS.get(name, '')}{text}{RESET}"
 
 
-def stream_output(proc: subprocess.Popen, name: str, stop_event: threading.Event):
-    """Читает stdout процесса и пишет в общий stdout с префиксом."""
+def make_file_logger(name: str, logs_dir: str) -> logging.Logger:
+    """Создаёт ротируемый файловый логгер для скрипта."""
+    log_path = os.path.join(logs_dir, f"{name}.log")
+    logger = logging.getLogger(f"file.{name}")
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    handler = RotatingFileHandler(
+        log_path,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+    return logger
+
+
+def stream_output(proc: subprocess.Popen, name: str, stop_event: threading.Event,
+                  file_logger: logging.Logger):
+    """Читает stdout процесса, пишет в терминал с префиксом и в лог-файл."""
     prefix = colorize(name, f"[{name}]")
     try:
         for line in iter(proc.stdout.readline, b""):
@@ -60,6 +87,7 @@ def stream_output(proc: subprocess.Popen, name: str, stop_event: threading.Event
                 break
             text = line.decode("utf-8", errors="replace").rstrip()
             print(f"{prefix} {text}", flush=True)
+            file_logger.info(text)
     except Exception:
         pass
 
@@ -73,6 +101,10 @@ def main():
     parser.add_argument(
         "--no-monitors", action="store_true",
         help="Не запускать stale_monitor и latency_monitor"
+    )
+    parser.add_argument(
+        "--logs-dir", metavar="DIR", default=LOGS_DIR,
+        help=f"Папка для лог-файлов (по умолчанию: logs/)"
     )
     args = parser.parse_args()
 
@@ -88,10 +120,20 @@ def main():
     else:
         to_run = SCRIPTS
 
+    # Создаём папку для логов
+    logs_dir = os.path.abspath(args.logs_dir)
+    os.makedirs(logs_dir, exist_ok=True)
+
+    # Лог самого run.py
+    run_logger = make_file_logger("run", logs_dir)
+
+    started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"Запуск {len(to_run)} скриптов: {', '.join(to_run)}", flush=True)
     print(f"Рабочая директория: {MARKET_DATA_DIR}", flush=True)
+    print(f"Логи: {logs_dir}/", flush=True)
     print(f"Для остановки: Ctrl+C или SIGTERM", flush=True)
     print("-" * 60, flush=True)
+    run_logger.info(f"[{started_at}] Запуск: {', '.join(to_run)}")
 
     processes: dict[str, subprocess.Popen] = {}
     threads: list[threading.Thread] = []
@@ -116,11 +158,18 @@ def main():
         )
         processes[name] = proc
 
-        t = threading.Thread(target=stream_output, args=(proc, name, stop_event), daemon=True)
+        file_logger = make_file_logger(name, logs_dir)
+        t = threading.Thread(
+            target=stream_output,
+            args=(proc, name, stop_event, file_logger),
+            daemon=True,
+        )
         t.start()
         threads.append(t)
 
-        print(f"  Запущен {name} (PID {proc.pid})", flush=True)
+        msg = f"Запущен {name} (PID {proc.pid}) → {logs_dir}/{name}.log"
+        print(f"  {msg}", flush=True)
+        run_logger.info(msg)
         time.sleep(0.1)  # небольшая задержка между стартами
 
     if not processes:
@@ -152,7 +201,9 @@ def main():
                 rc = proc.poll()
                 if rc is not None:
                     prefix = colorize(name, f"[{name}]")
-                    print(f"{prefix} процесс завершился с кодом {rc}", flush=True)
+                    msg = f"процесс завершился с кодом {rc}"
+                    print(f"{prefix} {msg}", flush=True)
+                    run_logger.info(f"[{name}] {msg}")
                     del processes[name]
 
             if not processes:
@@ -171,8 +222,10 @@ def main():
         try:
             proc.wait(timeout=remaining)
             print(f"[run.py] {name} завершён корректно.", flush=True)
+            run_logger.info(f"[{name}] завершён корректно")
         except subprocess.TimeoutExpired:
             print(f"[run.py] {name} не ответил за {grace}с — SIGKILL", flush=True)
+            run_logger.warning(f"[{name}] SIGKILL после {grace}с")
             proc.kill()
 
     stop_event.set()
@@ -180,6 +233,7 @@ def main():
         t.join(timeout=2)
 
     print("[run.py] Готово.", flush=True)
+    run_logger.info("Завершено")
 
 
 if __name__ == "__main__":
