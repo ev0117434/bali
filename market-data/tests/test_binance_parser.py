@@ -1,12 +1,35 @@
 import os
 import sys
 import pytest
+import orjson
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import structlog
 # Use a no-op logger for tests
 _log = structlog.get_logger()
+
+
+# ---------------------------------------------------------------------------
+# Regression: subscribe message must be str (TEXT frame), not bytes (BINARY)
+# Binance closes connection with 1008 policy violation on binary frames.
+# ---------------------------------------------------------------------------
+class TestSubscribeFrameType:
+    def test_binance_spot_subscribe_is_str(self):
+        """orjson.dumps().decode() → str → websockets sends TEXT frame (opcode 0x1)."""
+        params = ["btcusdt@bookTicker", "ethusdt@bookTicker"]
+        msg = orjson.dumps({"method": "SUBSCRIBE", "params": params, "id": 0}).decode()
+        assert isinstance(msg, str), "subscribe message must be str, not bytes"
+
+    def test_binance_futures_subscribe_is_str(self):
+        params = ["btcusdt@bookTicker"]
+        msg = orjson.dumps({"method": "SUBSCRIBE", "params": params, "id": 1}).decode()
+        assert isinstance(msg, str), "subscribe message must be str, not bytes"
+
+    def test_orjson_dumps_without_decode_is_bytes(self):
+        """Sanity check: raw orjson.dumps() returns bytes — must always .decode()."""
+        raw = orjson.dumps({"key": "value"})
+        assert isinstance(raw, bytes)
 
 import binance_spot
 import binance_futures

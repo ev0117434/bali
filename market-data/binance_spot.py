@@ -112,7 +112,7 @@ async def ws_worker(symbols: list[str], conn_id: int, redis_client, shutdown_eve
                 open_timeout=30,
             ) as ws:
                 log.info("ws_connected")
-                sub_msg = orjson.dumps({"method": "SUBSCRIBE", "params": params, "id": conn_id})
+                sub_msg = orjson.dumps({"method": "SUBSCRIBE", "params": params, "id": conn_id}).decode()
                 await ws.send(sub_msg)
                 attempt = 0  # reset after successful connect
 
