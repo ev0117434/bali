@@ -13,6 +13,10 @@ Cooldown: найденный сигнал по (direction, symbol) не пише
 Directions:
   A: binance_spot(ask) → bybit_futures(bid)
   B: bybit_spot(ask)   → binance_futures(bid)
+  C: okx_spot(ask)     → binance_futures(bid)
+  D: binance_spot(ask) → okx_futures(bid)
+  E: okx_spot(ask)     → bybit_futures(bid)
+  F: bybit_spot(ask)   → okx_futures(bid)
 """
 import asyncio
 import logging
@@ -37,7 +41,7 @@ except ImportError:
 # ── Конфигурация ──────────────────────────────────────────────────────────────
 MIN_SPREAD_PCT    = float(os.getenv("MIN_SPREAD_PCT",    "1.0"))
 SCAN_INTERVAL_MS  = int(os.getenv("SCAN_INTERVAL_MS",   "200"))   # 0.2 сек
-STALE_THRESHOLD_MS = int(os.getenv("STALE_THRESHOLD_SEC", "5")) * 1000
+STALE_THRESHOLD_MS = int(os.getenv("STALE_THRESHOLD_SEC", "300")) * 1000  # 5 минут
 SIGNAL_TTL        = int(os.getenv("SIGNAL_TTL",         "60"))    # Redis key TTL
 COOLDOWN_SEC      = int(os.getenv("SIGNAL_COOLDOWN_SEC", "3600")) # 1 час
 COOLDOWN_MS       = COOLDOWN_SEC * 1000
@@ -50,11 +54,19 @@ _BASE = os.path.join(os.path.dirname(__file__), "..", "dictionaries", "combinati
 PAIR_FILES = {
     "A": os.path.join(_BASE, "binance_spot_bybit_futures.txt"),
     "B": os.path.join(_BASE, "bybit_spot_binance_futures.txt"),
+    "C": os.path.join(_BASE, "okx_spot_binance_futures.txt"),
+    "D": os.path.join(_BASE, "binance_spot_okx_futures.txt"),
+    "E": os.path.join(_BASE, "okx_spot_bybit_futures.txt"),
+    "F": os.path.join(_BASE, "bybit_spot_okx_futures.txt"),
 }
 
 _SOURCES = {
     "A": {"buy": ("binance", "spot"),  "sell": ("bybit",   "futures")},
     "B": {"buy": ("bybit",   "spot"),  "sell": ("binance", "futures")},
+    "C": {"buy": ("okx",     "spot"),  "sell": ("binance", "futures")},
+    "D": {"buy": ("binance", "spot"),  "sell": ("okx",     "futures")},
+    "E": {"buy": ("okx",     "spot"),  "sell": ("bybit",   "futures")},
+    "F": {"buy": ("bybit",   "spot"),  "sell": ("okx",     "futures")},
 }
 
 # Папки
@@ -133,7 +145,7 @@ def calc_spread(
 ) -> dict | None:
     """
     Чистая функция. Возвращает сигнал-словарь если spread_pct >= MIN_SPREAD_PCT,
-    иначе None. Данные старше STALE_THRESHOLD_MS игнорируются.
+    иначе None.
     """
     buy_ask_raw, buy_qty_raw, buy_ts_raw = buy_data
     sell_bid_raw, sell_qty_raw, sell_ts_raw = sell_data
@@ -148,9 +160,6 @@ def calc_spread(
         return None
 
     if buy_ts == 0 or sell_ts == 0:
-        return None
-
-    if (ts_now - buy_ts) > STALE_THRESHOLD_MS or (ts_now - sell_ts) > STALE_THRESHOLD_MS:
         return None
 
     try:
