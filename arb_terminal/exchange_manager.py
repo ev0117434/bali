@@ -243,20 +243,28 @@ class ExchangeManager:
     # Order monitoring
     # ------------------------------------------------------------------
 
+    def _fetch_order_params(self, exchange: str, side: str) -> dict:
+        """Exchange-specific params for fetch_order."""
+        if exchange == "bybit" and side == "sell":
+            return {"category": "linear"}
+        return {}
+
     def refresh_order(self, info: "OrderInfo", ccxt_symbol: str) -> None:
         """Update OrderInfo in-place with latest exchange data."""
         if info.status in ("closed", "canceled", "error") or not info.order_id:
             return
         try:
+            params = self._fetch_order_params(info.exchange, info.side)
             if info.side == "buy":
                 raw = self.get_spot(info.exchange).fetch_order(
-                    info.order_id, ccxt_symbol
+                    info.order_id, ccxt_symbol, params
                 )
             else:
                 raw = self.get_futures(info.exchange).fetch_order(
-                    info.order_id, f"{ccxt_symbol}:USDT"
+                    info.order_id, f"{ccxt_symbol}:USDT", params
                 )
-            info.status = raw.get("status", info.status)
+            # raw.get("status") can exist but be None — use `or` to keep prev value
+            info.status = raw.get("status") or info.status
             info.filled = float(raw.get("filled") or 0)
             info.avg_price = float(raw.get("average") or 0)
             info.cost = float(raw.get("cost") or 0)

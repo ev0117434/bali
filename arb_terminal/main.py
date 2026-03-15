@@ -167,7 +167,7 @@ def build_fill_table(entry: TradeEntry, elapsed: float) -> Table:
             "open": "[yellow]OPEN[/]",
             "canceled": "[red]CANCELED[/]",
             "error": "[bold red]ERROR[/]",
-        }.get(info.status, f"[dim]{info.status}[/]")
+        }.get(info.status or "", f"[yellow]OPEN[/]" if not info.status else f"[dim]{info.status}[/]")
 
         fill_pct = (info.filled / info.planned_amount * 100) if info.planned_amount else 0
 

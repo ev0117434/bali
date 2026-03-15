@@ -197,7 +197,7 @@ class TestRefreshOrder:
             symbol="THE/USDT:USDT", planned_price=0.23585, planned_amount=424.0,
         )
         em.refresh_order(info, "THE/USDT")
-        futures.fetch_order.assert_called_once_with("456", "THE/USDT:USDT")
+        futures.fetch_order.assert_called_once_with("456", "THE/USDT:USDT", {})
         spot.fetch_order.assert_not_called()
 
     def test_exception_preserves_last_state(self, em_binance):
