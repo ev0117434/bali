@@ -88,6 +88,22 @@ _SOURCES = {
     "L": {"buy": ("okx",     "spot"),  "sell": ("gate",    "futures")},
 }
 
+# Полные имена направлений (используются в именах папок и файлов)
+DIRECTION_NAMES = {
+    "A": "binance_s_bybit_f",
+    "B": "bybit_s_binance_f",
+    "C": "okx_s_binance_f",
+    "D": "binance_s_okx_f",
+    "E": "okx_s_bybit_f",
+    "F": "bybit_s_okx_f",
+    "G": "gate_s_binance_f",
+    "H": "binance_s_gate_f",
+    "I": "gate_s_bybit_f",
+    "J": "bybit_s_gate_f",
+    "K": "gate_s_okx_f",
+    "L": "okx_s_gate_f",
+}
+
 # Папки
 _ROOT       = os.path.join(os.path.dirname(__file__), "..")
 LOGS_DIR    = os.path.join(_ROOT, "logs")
@@ -120,15 +136,15 @@ def make_activity_logger() -> logging.Logger:
 
 
 def make_signal_logger() -> logging.Logger:
-    """signals/spread_signals.jsonl — один JSON на каждый новый сигнал."""
+    """signals/spread_signals.csv — строки формата spot_exch,fut_exch,symbol,ask_spot,bid_futures,spread_pct,ts"""
     os.makedirs(SIGNALS_DIR, exist_ok=True)
-    return _rotating("ss.signals", os.path.join(SIGNALS_DIR, "spread_signals.jsonl"), _100MB, 10)
+    return _rotating("ss.signals", os.path.join(SIGNALS_DIR, "spread_signals.csv"), _100MB, 10)
 
 
 def make_anomaly_logger() -> logging.Logger:
-    """signals/spread_signals_anomalies.jsonl — сигналы со спредом > ANOMALY_SPREAD_PCT."""
+    """signals/spread_signals_anomalies.csv — сигналы со спредом > ANOMALY_SPREAD_PCT."""
     os.makedirs(SIGNALS_DIR, exist_ok=True)
-    return _rotating("ss.anomalies", os.path.join(SIGNALS_DIR, "spread_signals_anomalies.jsonl"), _100MB, 10)
+    return _rotating("ss.anomalies", os.path.join(SIGNALS_DIR, "spread_signals_anomalies.csv"), _100MB, 10)
 
 
 # ── Prometheus заглушки ───────────────────────────────────────────────────────
@@ -294,26 +310,33 @@ class SpreadScanner:
                 continue
 
             payload = orjson.dumps(sig).decode()
-            to_write.append((sig, payload))
+            # CSV: spot_exch,fut_exch,symbol,ask_spot,bid_futures,spread_pct,ts
+            csv_line = (
+                f"{sig['buy_exchange']},{sig['sell_exchange']},"
+                f"{sig['symbol']},"
+                f"{sig['buy_ask']},{sig['sell_bid']},"
+                f"{sig['spread_pct']},{sig['ts_signal']}"
+            )
+            to_write.append((sig, payload, csv_line))
             self._cooldown[key] = ts_now
 
         # ── 3. Пишем сигналы (Redis + signals/) ──────────────────────────────
         if to_write:
             sig_pipe = self.redis.pipeline(transaction=False)
-            for sig, payload in to_write:
+            for sig, payload, _csv in to_write:
                 sig_pipe.set(f"sig:spread:{sig['direction']}:{sig['symbol']}", payload, ex=SIGNAL_TTL)
                 sig_pipe.publish(SIGNAL_CHANNEL, payload)
             await sig_pipe.execute()
 
-            for sig, payload in to_write:
+            for sig, payload, csv_line in to_write:
                 _sig_counter.labels(direction=sig["direction"]).inc()
-                self.signal_log.info(payload)    # → signals/spread_signals.jsonl
+                self.signal_log.info(csv_line)    # → signals/spread_signals.csv
                 if sig["spread_pct"] >= ANOMALY_SPREAD_PCT:
-                    self.anomaly_log.info(payload)   # → signals/spread_signals_anomalies.jsonl
+                    self.anomaly_log.info(csv_line)   # → signals/spread_signals_anomalies.csv
                 self.log.info(                   # → stdout
                     "spread_signal",
                     symbol=sig["symbol"],
-                    direction=sig["direction"],
+                    direction=DIRECTION_NAMES.get(sig["direction"], sig["direction"]),
                     spread_pct=sig["spread_pct"],
                     buy_ask=sig["buy_ask"],
                     sell_bid=sig["sell_bid"],
