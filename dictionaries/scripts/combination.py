@@ -20,7 +20,7 @@ FILES = {
     ("okx", "futures"):     ALL_PAIRS_DIR / "okx"     / "okx_futures.txt",
 }
 
-# 12 комбинаций (как ты перечислил)
+# 12 комбинаций
 COMBINATIONS = [
     ("okx", "spot", "mexc", "futures"),
     ("okx", "spot", "bybit", "futures"),
@@ -36,22 +36,14 @@ COMBINATIONS = [
     ("binance", "spot", "bybit", "futures"),
 ]
 
+
 def normalize_pair(raw: str, exchange: str, market: str) -> str | None:
-    """
-    Приводим пары к единому виду: BASEQUOTE (например BTCUSDT).
-    Нюанс OKX:
-      - spot:    BTC-USDT      -> BTCUSDT
-      - futures: ALLO-USDT-SWAP-> ALLOUSDT
-    Для остальных бирж тоже пытаемся аккуратно нормализовать (/ - _ :), если встретится.
-    """
     s = raw.strip().upper()
     if not s:
         return None
 
-    # выкидываем всё после пробела/табов (если в строке ещё что-то)
     s = s.split()[0]
 
-    # OKX: всегда BASE-QUOTE-... (spot: BASE-QUOTE, futures: BASE-QUOTE-SWAP)
     if exchange == "okx":
         parts = s.split("-")
         if len(parts) >= 2:
@@ -60,9 +52,6 @@ def normalize_pair(raw: str, exchange: str, market: str) -> str | None:
                 return f"{base}{quote}"
         return None
 
-    # Универсальная нормализация для остальных:
-    # - Если есть разделитель, берём первые 2 токена как base/quote
-    # - Иначе оставляем как есть (например BTCUSDT уже норм)
     for sep in ("/", "-", "_"):
         if sep in s:
             parts = [p for p in s.split(sep) if p]
@@ -71,13 +60,9 @@ def normalize_pair(raw: str, exchange: str, market: str) -> str | None:
                 return f"{base}{quote}"
             return None
 
-    # Иногда встречается формат типа BTCUSDT:USDT или BTCUSDT-PERP и т.п.
-    # Берём часть до ':' и до последнего '-' если там PERP/SWAP и пр.
     if ":" in s:
         s = s.split(":", 1)[0]
 
-    # Если вдруг попался хвост через '-' (редко у не-okx), режем его
-    # но только если это явно хвост типа PERP/SWAP/FUT
     if "-" in s:
         left, right = s.split("-", 1)
         if right in {"PERP", "SWAP", "FUT", "FUTURES"}:
@@ -86,10 +71,11 @@ def normalize_pair(raw: str, exchange: str, market: str) -> str | None:
     return s or None
 
 
-def load_set(exchange: str, market: str) -> set[str]:
+def load_set(exchange: str, market: str) -> set[str] | None:
+    """Возвращает set пар или None, если файл не найден."""
     path = FILES[(exchange, market)]
     if not path.exists():
-        raise FileNotFoundError(f"Не найден файл: {path}")
+        return None
 
     out: set[str] = set()
     with path.open("r", encoding="utf-8") as f:
@@ -103,31 +89,47 @@ def load_set(exchange: str, market: str) -> set[str]:
 def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Загружаем 8 списков в память (как множества)
+    # Загружаем все доступные списки
     sets: dict[tuple[str, str], set[str]] = {}
-    print("=== INPUT LISTS COUNTS (unique after mapping) ===")
+    print("=== INPUT LISTS ===")
     for (ex, mk), path in FILES.items():
         s = load_set(ex, mk)
-        sets[(ex, mk)] = s
-        print(f"{ex}_{mk:7s} : {len(s):>7d}  |  {path}")
+        if s is not None:
+            sets[(ex, mk)] = s
+            print(f"  OK   {ex}_{mk:7s} : {len(s):>7d}  |  {path}")
+        else:
+            print(f"  SKIP {ex}_{mk:7s} : файл не найден  |  {path}")
 
-    # Генерим 12 пересечений
-    print("\n=== OUTPUT INTERSECTIONS COUNTS ===")
+    # Генерим пересечения только для тех комбинаций, где оба файла загружены
+    print("\n=== OUTPUT INTERSECTIONS ===")
+    done = 0
+    skipped = 0
     for a_ex, a_mk, b_ex, b_mk in COMBINATIONS:
-        a = sets[(a_ex, a_mk)]
-        b = sets[(b_ex, b_mk)]
-        inter = a & b
-
         name = f"{a_ex}_{a_mk}_{b_ex}_{b_mk}"
+
+        missing = []
+        if (a_ex, a_mk) not in sets:
+            missing.append(f"{a_ex}_{a_mk}")
+        if (b_ex, b_mk) not in sets:
+            missing.append(f"{b_ex}_{b_mk}")
+
+        if missing:
+            print(f"  SKIP {name:30s} : нет данных для {', '.join(missing)}")
+            skipped += 1
+            continue
+
+        inter = sets[(a_ex, a_mk)] & sets[(b_ex, b_mk)]
         out_path = OUT_DIR / f"{name}.txt"
 
         with out_path.open("w", encoding="utf-8") as w:
             for sym in sorted(inter):
                 w.write(sym + "\n")
 
-        print(f"{name:30s} : {len(inter):>7d}  ->  {out_path}")
+        print(f"  OK   {name:30s} : {len(inter):>7d}  ->  {out_path}")
+        done += 1
 
-    print("\nDone.")
+    print(f"\nDone. Комбинаций: {done} выполнено, {skipped} пропущено.")
+
 
 if __name__ == "__main__":
     main()

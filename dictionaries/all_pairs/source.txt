@@ -1,8 +1,0 @@
-binance_spot
-binance_futures
-bybit_spot
-bybit_futures
-mexc_spot
-mexc_futures
-okx_spot
-okx_futures
