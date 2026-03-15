@@ -26,6 +26,7 @@ MARKET = "spot"
 WS_URL = "wss://stream.bybit.com/v5/public/spot"
 PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "20"))
 STATS_INTERVAL = int(os.getenv("WS_STATS_INTERVAL", "60"))
+SUB_BATCH_SIZE = 10  # Bybit limit: max 10 topics per subscribe message
 SYMBOLS_FILE = os.path.join(
     os.path.dirname(__file__), "..", "dictionaries", "subscribe", "bybit", "bybit_spot.txt"
 )
@@ -216,7 +217,11 @@ async def ws_worker(
     log = log.bind(conn_id=conn_id, symbols_count=len(symbols))
     writer = RedisWriter(redis_client, log)
     sub_args = [f"tickers.{s}" for s in symbols]
-    sub_msg = orjson.dumps({"op": "subscribe", "args": sub_args}).decode()
+    # Bybit allows max 10 topics per subscribe message — split into batches
+    sub_batches = [
+        orjson.dumps({"op": "subscribe", "args": sub_args[i : i + SUB_BATCH_SIZE]}).decode()
+        for i in range(0, len(sub_args), SUB_BATCH_SIZE)
+    ]
     counter = [0]
     attempt = 0
 
@@ -228,8 +233,9 @@ async def ws_worker(
                 open_timeout=30,
                 close_timeout=5,
             ) as ws:
-                log.info("ws_connected", attempt=attempt)
-                await ws.send(sub_msg)
+                log.info("ws_connected", attempt=attempt, sub_batches=len(sub_batches))
+                for batch in sub_batches:
+                    await ws.send(batch)
                 attempt = 0
 
                 bg = [
