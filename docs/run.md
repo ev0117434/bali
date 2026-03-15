@@ -1,6 +1,6 @@
 # run.py — лаунчер
 
-Единая точка запуска всех 11 скриптов.
+Единая точка запуска всех 12 скриптов.
 
 ## Что делает
 
@@ -14,12 +14,30 @@
 ## Использование
 
 ```bash
-python3 run.py                                       # все 11 скриптов
-python3 run.py --no-monitors                         # без stale_monitor и latency_monitor
-python3 run.py --only binance_spot bybit_spot        # выборочно
-python3 run.py --logs-dir /var/log/market-data       # своя папка логов
-python3 run.py --no-cleanup                          # не очищать Redis и logs/ при старте
+python3 run.py                                        # все 12 скриптов
+python3 run.py --no-monitors                          # без stale_monitor и latency_monitor
+python3 run.py --only binance_spot bybit_spot         # выборочно
+python3 run.py --only spread_scanner signal_snapshot  # только сканер + снапшоты
+python3 run.py --logs-dir /var/log/market-data        # своя папка логов
+python3 run.py --no-cleanup                           # не очищать Redis и logs/ при старте
 ```
+
+## Список процессов
+
+| Скрипт | Расположение | Описание |
+|--------|-------------|---------|
+| `binance_spot` | market-data/ | WS-коллектор Binance spot |
+| `binance_futures` | market-data/ | WS-коллектор Binance futures |
+| `bybit_spot` | market-data/ | WS-коллектор Bybit spot |
+| `bybit_futures` | market-data/ | WS-коллектор Bybit futures |
+| `okx_spot` | market-data/ | WS-коллектор OKX spot |
+| `okx_futures` | market-data/ | WS-коллектор OKX futures |
+| `gate_spot` | market-data/ | WS-коллектор Gate.io spot |
+| `gate_futures` | market-data/ | WS-коллектор Gate.io futures |
+| `stale_monitor` | market-data/ | Алерт если символ не обновлялся > 60s |
+| `latency_monitor` | market-data/ | Замер e2e задержки WS→Redis |
+| `spread_scanner` | spread-scanner/ | Арбитражный сканер, 12 направлений |
+| `signal_snapshot` | spread-scanner/ | Снапшоты по сигналу: 0.3с × 3500с |
 
 ## Логи
 
@@ -27,7 +45,7 @@ python3 run.py --no-cleanup                          # не очищать Redis
 
 ```
 logs/
-├── run.log              # старт/стоп лаунчера, exit codes процессов
+├── run.log
 ├── binance_spot.log
 ├── binance_futures.log
 ├── bybit_spot.log
@@ -38,11 +56,11 @@ logs/
 ├── gate_futures.log
 ├── stale_monitor.log
 ├── latency_monitor.log
-└── spread_scanner.log
+├── spread_scanner.log
+└── signal_snapshot.log
 ```
 
 **Ротация:** 50 МБ на файл, 5 архивных копий → максимум ~300 МБ на скрипт.
-При ротации старый файл переименовывается в `binance_spot.log.1`, `.2` и т.д.
 
 Логи дублируются и в терминал — цветом по скрипту:
 
@@ -59,6 +77,7 @@ logs/
 | stale_monitor | фиолетовый |
 | latency_monitor | красный |
 | spread_scanner | оранжевый |
+| signal_snapshot | пурпурный |
 
 ## Что run.py не делает
 

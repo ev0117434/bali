@@ -86,7 +86,7 @@ redis-cli HGETALL md:binance:spot:BTCUSDT
 
 ## `clock_skew_detected` в логах
 
-**Не ошибка.** Означает что `ts_received < ts_exchange` — часы коллектора отстают от часов биржи. Допустимо, метрика `exchange_to_collector` просто будет отрицательной.
+**Не ошибка.** Означает что `ts_received < ts_exchange` — часы коллектора отстают от часов биржи. Метрика `exchange_to_collector` будет отрицательной.
 
 Если расхождение большое (> 1 сек) — синхронизировать NTP:
 ```bash
@@ -104,6 +104,59 @@ sudo systemctl restart systemd-timesyncd
 # Принудительная остановка
 kill -KILL $(pgrep -f "binance_spot.py")
 ```
+
+---
+
+## Нет файлов сигналов в signals/
+
+**`signals/spread_signals.csv` не создаётся:**
+
+1. Сканер запущен, но не находит спредов — нормально при спокойном рынке. Проверить `MIN_SPREAD_PCT` в `.env` (по умолчанию 1.0%).
+2. Сканер не запущен:
+```bash
+ps aux | grep spread_scanner
+tail -20 logs/spread_scanner.log
+```
+3. Файлы combination пустые:
+```bash
+wc -l dictionaries/combination/*.txt
+```
+
+---
+
+## signal_snapshot не создаёт файлы снапшотов
+
+**Папки `signals/{direction}/` не создаются:**
+
+1. Нет сигналов → нет снапшотов. Сначала убедиться что `spread_signals.csv` пополняется.
+2. `signal_snapshot` не подписан на канал. Проверить лог:
+```bash
+tail -20 logs/signal_snapshot.log
+```
+3. Проверить что канал активен:
+```bash
+redis-cli subscribe ch:spread_signals
+# Дождаться сигнала или подать вручную для теста:
+redis-cli publish ch:spread_signals '{"symbol":"BTCUSDT","direction":"A","buy_exchange":"binance","buy_market":"spot","buy_ask":"45000","buy_ask_qty":"1","sell_exchange":"bybit","sell_market":"futures","sell_bid":"45500","sell_bid_qty":"1","spread_pct":1.11,"ts_signal":1741234567890}'
+```
+
+---
+
+## Формат файлов снапшотов
+
+Каждый файл `signals/{dir_name}/{SYMBOL}_{ts}.csv`:
+- Первая строка — цены в момент обнаружения сигнала
+- Последующие строки — текущие цены из Redis (каждые 0.3 сек, 3500 сек)
+
+```
+spot_exch,fut_exch,symbol,ask_spot,bid_futures,spread_pct,ts
+binance,bybit,BTCUSDT,45000.1,45451.5,1.0023,1741234567890
+binance,bybit,BTCUSDT,45001.0,45452.0,1.0022,1741234568190
+binance,bybit,BTCUSDT,44999.5,45450.0,1.0012,1741234568490
+...
+```
+
+Если цены недоступны в Redis (ключ истёк или коллектор упал) — поля `ask_spot` и `bid_futures` будут пустыми, `spread_pct` тоже.
 
 ---
 

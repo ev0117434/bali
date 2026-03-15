@@ -15,32 +15,34 @@
 └───────────────────────────┬──────────────────────────────────────┘
                             │ читают при старте
                             ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            Биржи (WS)                                       │
-│  Binance Spot  Binance Fut  Bybit Spot  Bybit Fut  OKX Spot  OKX Fut        │
-│  Gate Spot     Gate Fut                                                     │
-└────┬──────────────┬─────────────┬──────────┬──────────┬───────┬─────────────┘
-     │              │             │          │          │       │
-     ▼              ▼             ▼          ▼          ▼       ▼
-binance_spot  binance_futures  bybit_spot  bybit_fut  okx_spot  okx_fut
-gate_spot     gate_futures
-  (N conn)      (N conn)        (N conn)   (N conn)  (N conn) (N conn)
-     │              │             │          │          │       │
-     └──────────────┴─────────────┴──────────┴──────────┴───────┘
-                                    │
-                    Redis Pipeline (HSET + EXPIRE + PUBLISH)
-                                    │
-                              ┌─────▼──────┐
-                              │   Redis    │
-                              │            │
-                              │  md:*:*:*  │  ← Hash keys (TTL 300s)
-                              │            │
-                              └─────┬──────┘
-                                    │
-               ┌────────────────────┼──────────────────┬──────────────┐
-               │                    │                   │              │
-         stale_monitor   latency_monitor      spread_scanner      consumers
-          (SCAN+HGET)    (SCAN+HMGET)        (pipeline HMGET)   (SUBSCRIBE)
+┌─────────────────────────────────────────────────────────────────┐
+│                         Биржи (WS)                              │
+│  Binance Spot/Fut  Bybit Spot/Fut  OKX Spot/Fut  Gate Spot/Fut  │
+└──┬──────────────────────────────────────────────────────────────┘
+   │  8 коллекторов (N WS-соединений каждый)
+   ▼
+HSET md:{exchange}:{market}:{symbol}  +  EXPIRE TTL  +  PUBLISH md:updates:*
+   │
+   ▼
+┌──────────┐
+│  Redis   │  md:*:*:*  (Hash, TTL 300s)
+└────┬─────┘
+     │
+     ├──► stale_monitor    (SCAN + HGET, алерт если нет обновлений > 60s)
+     ├──► latency_monitor  (SCAN + HMGET, считает e2e задержку)
+     │
+     └──► spread_scanner   (pipeline HMGET каждые 200ms)
+               │
+               │  спред ≥ MIN_SPREAD_PCT
+               ├──► SET  sig:spread:{direction}:{symbol}  (TTL 60s)
+               ├──► PUBLISH ch:spread_signals  {json}
+               └──► signals/spread_signals.csv  (CSV-строка)
+                         │
+                         ▼  pub/sub
+                   signal_snapshot
+                         │
+                         └──► signals/{dir_name}/{SYMBOL}_{ts}.csv
+                              (снапшот каждые 0.3с, 3500с)
 ```
 
 ## Поток данных
@@ -71,21 +73,137 @@ Binance Spot:    ~270 / 150 = 2 соединения
 Binance Futures: ~310 / 150 = 3 соединения
 Bybit Spot:      ~310 / 150 = 3 соединения
 Bybit Futures:   ~270 / 150 = 2 соединения
-OKX Spot:        ~270 / 150 = 2 соединения  (лимит OKX: 300/conn)
+OKX Spot:        ~270 / 150 = 2 соединения
 OKX Futures:     ~270 / 150 = 2 соединения
 Gate.io Spot:    ~270 / 150 = 2 соединения
 Gate.io Futures: ~270 / 150 = 2 соединения
 
 Итого: ~18 WS-соединений одновременно
-(точное число зависит от текущих subscribe/*.txt)
 ```
 
 Каждое соединение — отдельная asyncio.Task. Падение одного не влияет на остальные.
 
+## Модуль spread-scanner
+
+### spread_scanner.py
+
+Запускается автоматически через `run.py`. Сканирует 12 направлений арбитража:
+
+| Ключ | Направление |
+|------|------------|
+| A | binance_spot(ask) → bybit_futures(bid) |
+| B | bybit_spot(ask) → binance_futures(bid) |
+| C | okx_spot(ask) → binance_futures(bid) |
+| D | binance_spot(ask) → okx_futures(bid) |
+| E | okx_spot(ask) → bybit_futures(bid) |
+| F | bybit_spot(ask) → okx_futures(bid) |
+| G | gate_spot(ask) → binance_futures(bid) |
+| H | binance_spot(ask) → gate_futures(bid) |
+| I | gate_spot(ask) → bybit_futures(bid) |
+| J | bybit_spot(ask) → gate_futures(bid) |
+| K | gate_spot(ask) → okx_futures(bid) |
+| L | okx_spot(ask) → gate_futures(bid) |
+
+Каждый цикл (по умолчанию 200 мс): один Redis pipeline → HMGET всех пар → расчёт спреда.
+Cooldown по умолчанию: 3600 сек на (direction, symbol).
+Поддерживает SIGHUP для перезагрузки файлов символов без перезапуска.
+
+**Файлы сигналов:**
+
+```
+signals/spread_signals.csv              # все сигналы
+signals/spread_signals_anomalies.csv    # спред > ANOMALY_SPREAD_PCT (300%)
+```
+
+**Формат строки в CSV:**
+```
+spot_exch,fut_exch,symbol,ask_spot,bid_futures,spread_pct,ts
+binance,bybit,BTCUSDT,45000.1,45451.5,1.0023,1741234567890
+```
+
+**Формат сигнала в Redis (pub/sub и SET):**
+```json
+{
+  "symbol":        "BTCUSDT",
+  "direction":     "A",
+  "buy_exchange":  "binance",
+  "buy_market":    "spot",
+  "buy_ask":       "45000.1",
+  "buy_ask_qty":   "0.532",
+  "sell_exchange": "bybit",
+  "sell_market":   "futures",
+  "sell_bid":      "45451.5",
+  "sell_bid_qty":  "1.2",
+  "spread_pct":    1.0023,
+  "ts_signal":     1741234567890
+}
+```
+
+Redis-ключ последнего сигнала: `sig:spread:{direction}:{symbol}` (TTL 60s)
+Redis-канал: `ch:spread_signals`
+
+### signal_snapshot.py
+
+Подписывается на `ch:spread_signals`. При получении сигнала запускает asyncio-задачу,
+которая **3500 секунд каждые 0.3 сек** читает текущие цены из Redis и пишет строку в файл.
+
+**Файловая структура:**
+```
+signals/
+  binance_s_bybit_f/          ← направление A
+    BTCUSDT_1741234567890.csv
+    ETHUSDT_1741234567891.csv
+  bybit_s_binance_f/          ← направление B
+  okx_s_binance_f/            ← C
+  binance_s_okx_f/            ← D
+  okx_s_bybit_f/              ← E
+  bybit_s_okx_f/              ← F
+  gate_s_binance_f/           ← G
+  binance_s_gate_f/           ← H
+  gate_s_bybit_f/             ← I
+  bybit_s_gate_f/             ← J
+  gate_s_okx_f/               ← K
+  okx_s_gate_f/               ← L
+```
+
+**Формат строк:** такой же CSV как у spread_scanner:
+```
+spot_exch,fut_exch,symbol,ask_spot,bid_futures,spread_pct,ts
+```
+Первая строка — исходный сигнал (цены в момент его обнаружения).
+Последующие строки — текущие цены на каждом тике 0.3 сек.
+
+Несколько сигналов на разные символы/направления обрабатываются параллельно (asyncio tasks).
+
+### Как подписаться на сигналы из другого скрипта
+
+```python
+import asyncio, orjson
+from common import get_redis
+
+async def main():
+    redis  = get_redis()
+    pubsub = redis.pubsub()
+    await pubsub.subscribe("ch:spread_signals")
+
+    async for message in pubsub.listen():
+        if message["type"] != "message":
+            continue
+        sig = orjson.loads(message["data"])
+        # sig содержит: symbol, direction, buy_exchange, sell_exchange,
+        #               buy_ask, sell_bid, spread_pct, ts_signal
+
+asyncio.run(main())
+```
+
+Проверка в терминале:
+```bash
+redis-cli subscribe ch:spread_signals
+```
+
 ## Модуль dictionaries
 
 Запускается вручную (`python3 dictionaries/main.py`) для актуализации списков символов.
-Коллекторы `market-data/` читают результат при каждом старте.
 
 ### Пайплайн
 
@@ -96,11 +214,10 @@ Gate.io Futures: ~270 / 150 = 2 соединения
       OKX     /instruments
       Gate.io /currency_pairs + /contracts
           ↓
-   Все USDT/USDC пары → сохранить в {exchange}/data/
+   Все USDT/USDC пары → {exchange}/data/
 
 2. WebSocket-валидация (4 биржи параллельно, 60 сек)
       Подписка на все пары → наблюдение
-      Фиксируем пары, давшие хоть 1 ответ
           ↓
    Активные пары → {exchange}/data/{exchange}_{market}_active.txt
 
@@ -110,7 +227,6 @@ Gate.io Futures: ~270 / 150 = 2 соединения
    combination/*.txt
 
 4. Subscribe-файлы (8 файлов)
-      Из combination-файлов по ключевым словам в имени
           ↓
    subscribe/{exchange}/{exchange}_{market}.txt
 ```
@@ -119,51 +235,10 @@ Gate.io Futures: ~270 / 150 = 2 соединения
 
 | Биржа | Нативный формат | Нормализованный |
 |-------|----------------|----------------|
-| Binance | `BTCUSDT` | `BTCUSDT` (без изменений) |
-| Bybit | `BTCUSDT` | `BTCUSDT` (без изменений) |
+| Binance | `BTCUSDT` | `BTCUSDT` |
+| Bybit | `BTCUSDT` | `BTCUSDT` |
 | OKX | `BTC-USDT`, `BTC-USDT-SWAP` | `BTCUSDT` |
 | Gate.io | `BTC_USDT` | `BTCUSDT` |
-
-OKX и Gate.io хранят нативные символы в отдельных файлах — они нужны для WS-подписки.
-Во всех остальных местах (combination, subscribe) используется нормализованный формат.
-
-### Комбинации
-
-12 пересечений: все возможные пары из 4 бирж × 2 рынка:
-
-```
-binance_spot ↔ bybit_futures   (2 файла: bsbyf + bysbf)
-binance_spot ↔ okx_futures     (2 файла)
-binance_spot ↔ gate_futures    (2 файла)
-bybit_spot   ↔ okx_futures     (2 файла)
-bybit_spot   ↔ gate_futures    (2 файла)
-okx_spot     ↔ gate_futures    (2 файла)
-```
-
-## Модуль spread-scanner
-
-Запускается автоматически через `run.py`. Сканирует 12 направлений арбитража:
-
-```
-A: binance_spot(ask) → bybit_futures(bid)
-B: bybit_spot(ask)   → binance_futures(bid)
-C: okx_spot(ask)     → binance_futures(bid)
-D: binance_spot(ask) → okx_futures(bid)
-E: okx_spot(ask)     → bybit_futures(bid)
-F: bybit_spot(ask)   → okx_futures(bid)
-G: gate_spot(ask)    → binance_futures(bid)
-H: binance_spot(ask) → gate_futures(bid)
-I: gate_spot(ask)    → bybit_futures(bid)
-J: bybit_spot(ask)   → gate_futures(bid)
-K: gate_spot(ask)    → okx_futures(bid)
-L: okx_spot(ask)     → gate_futures(bid)
-```
-
-Каждый цикл (по умолчанию 200 мс): один Redis pipeline → HMGET всех пар → расчёт спреда.
-Сигналы при спреде ≥ `MIN_SPREAD_PCT` (1.0%) записываются в `signals/spread_signals.jsonl`
-и публикуются в Redis канал `ch:spread_signals`.
-Cooldown по умолчанию: 3600 сек на (direction, symbol).
-Поддерживает SIGHUP для перезагрузки файлов символов без перезапуска.
 
 ## Отказоустойчивость
 
@@ -181,18 +256,9 @@ Redis down            буфер deque(1000), запись при recovery
 
 ```
 stale_monitor ──SCAN──► Redis ──ts_redis──► delta > 60s? ──► PUBLISH alerts:stale
-                                                           └──► log WARNING stale_detected
+                                                          └──► log WARNING stale_detected
 
 latency_monitor ─SCAN─► Redis ──ts fields──► stats(min/avg/p95) ──► log INFO latency_report
                                           └──► e2e > 1000ms? ──► log WARNING latency_anomaly
                                           └──► e2e > 5000ms? ──► log CRITICAL latency_anomaly
 ```
-
-## Масштабирование
-
-Текущая архитектура рассчитана на одну машину. При необходимости горизонтального масштабирования:
-
-- **Несколько Redis** — изменить `REDIS_URL` в каждом скрипте. Коллекторы stateless.
-- **Разделение символов** — отредактировать `subscribe/*.txt` файлы, запустить несколько экземпляров.
-- **Добавить биржу в market-data** — новый коллектор по аналогии с существующими.
-- **Добавить биржу в dictionaries** — новая папка `{exchange}/` с `*_pairs.py` и `*_ws.py`, добавить в `COMBINATIONS` и `SUBSCRIBE_MAP` в `main.py`.
