@@ -14,6 +14,7 @@ Market Data Collector — единая точка запуска.
 """
 import argparse
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -23,9 +24,12 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 import logging
 
-MARKET_DATA_DIR   = os.path.join(os.path.dirname(__file__), "market-data")
+MARKET_DATA_DIR    = os.path.join(os.path.dirname(__file__), "market-data")
 SPREAD_SCANNER_DIR = os.path.join(os.path.dirname(__file__), "spread-scanner")
-LOGS_DIR = os.path.join(os.path.dirname(__file__), "logs")
+LOGS_DIR           = os.path.join(os.path.dirname(__file__), "logs")
+SIGNALS_DIR        = os.path.join(os.path.dirname(__file__), "signals")
+
+CLEANUP_DELAY = int(os.getenv("CLEANUP_DELAY", "3"))  # секунды обратного отсчёта
 
 # Директория скрипта (по умолчанию MARKET_DATA_DIR, кроме исключений)
 SCRIPT_DIRS = {
@@ -68,6 +72,54 @@ COLORS = {
     "spread_scanner":  "\033[33m",  # оранжевый
 }
 RESET = "\033[0m"
+
+
+def startup_cleanup(logs_dir: str) -> None:
+    """
+    Выполняется при старте:
+      1. Удаляет папку логов (logs/)
+      2. Удаляет папку сигналов (signals/)
+      3. Очищает текущую БД Redis (FLUSHDB)
+    Перед удалением показывает countdown CLEANUP_DELAY секунд.
+    """
+    print(f"[run.py] Очистка данных через {CLEANUP_DELAY} сек... (Ctrl+C для отмены)", flush=True)
+    try:
+        for i in range(CLEANUP_DELAY, 0, -1):
+            print(f"[run.py]   {i}...", flush=True)
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n[run.py] Очистка отменена.", flush=True)
+        sys.exit(0)
+
+    # 1. Папка логов
+    if os.path.exists(logs_dir):
+        shutil.rmtree(logs_dir, ignore_errors=True)
+        print(f"[run.py] Удалена папка логов:    {logs_dir}", flush=True)
+
+    # 2. Папка сигналов
+    if os.path.exists(SIGNALS_DIR):
+        shutil.rmtree(SIGNALS_DIR, ignore_errors=True)
+        print(f"[run.py] Удалена папка сигналов: {SIGNALS_DIR}", flush=True)
+
+    # 3. Redis FLUSHDB
+    try:
+        try:
+            from dotenv import load_dotenv
+            _env_file = os.path.join(MARKET_DATA_DIR, ".env")
+            if os.path.exists(_env_file):
+                load_dotenv(_env_file)
+        except ImportError:
+            pass
+        import redis as _redis_sync
+        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        _r = _redis_sync.Redis.from_url(redis_url)
+        _r.flushdb()
+        _r.close()
+        print(f"[run.py] Redis очищен (FLUSHDB): {redis_url}", flush=True)
+    except Exception as exc:
+        print(f"[run.py] Не удалось очистить Redis: {exc}", flush=True)
+
+    print("-" * 60, flush=True)
 
 
 def colorize(name: str, text: str) -> str:
@@ -122,6 +174,10 @@ def main():
         "--logs-dir", metavar="DIR", default=LOGS_DIR,
         help=f"Папка для лог-файлов (по умолчанию: logs/)"
     )
+    parser.add_argument(
+        "--no-cleanup", action="store_true",
+        help="Не очищать Redis и не удалять logs/ и signals/ при старте"
+    )
     args = parser.parse_args()
 
     # Определяем список скриптов для запуска
@@ -136,8 +192,13 @@ def main():
     else:
         to_run = SCRIPTS
 
-    # Создаём папку для логов
     logs_dir = os.path.abspath(args.logs_dir)
+
+    # Очистка Redis, logs/ и signals/ при старте (если не отключена)
+    if not args.no_cleanup:
+        startup_cleanup(logs_dir)
+
+    # Создаём папку для логов (могла быть удалена cleanup-ом)
     os.makedirs(logs_dir, exist_ok=True)
 
     # Лог самого run.py
