@@ -13,11 +13,14 @@ Design
   category) are handled internally.
 """
 
+import logging
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
 import ccxt
+
+_log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # ccxt class name mapping
@@ -76,9 +79,19 @@ class ExchangeManager:
                     self._init_exchange(exchange)
 
     def _init_exchange(self, exchange: str) -> None:
+        _log.info("Initializing exchange: %s", exchange)
         ccxt_name = _CCXT_NAME.get(exchange, exchange)
         ExClass = getattr(ccxt, ccxt_name)
         keys = self._keys.get(exchange, {})
+
+        if not keys.get("apiKey") or not keys.get("secret"):
+            _log.warning(
+                "API keys for %s are empty or missing — "
+                "set %s_API_KEY and %s_SECRET in .env",
+                exchange,
+                exchange.upper(),
+                exchange.upper(),
+            )
 
         base: dict = {
             "apiKey": keys.get("apiKey", ""),
@@ -98,14 +111,34 @@ class ExchangeManager:
 
         # Testnet / sandbox via ccxt built-in (works for Binance, Bybit)
         if keys.get("testnet"):
+            _log.info("%s: enabling sandbox/testnet mode", exchange)
             spot.set_sandbox_mode(True)
             futures.set_sandbox_mode(True)
 
-        spot.load_markets()
-        futures.load_markets()
+        try:
+            spot.load_markets()
+        except Exception as exc:
+            _log.error(
+                "Failed to load spot markets for %s: %s", exchange, exc, exc_info=True
+            )
+            raise
+
+        try:
+            futures.load_markets()
+        except Exception as exc:
+            _log.error(
+                "Failed to load futures markets for %s: %s", exchange, exc, exc_info=True
+            )
+            raise
 
         self._spot[exchange] = spot
         self._futures[exchange] = futures
+        _log.info(
+            "Exchange %s initialized — spot=%d markets, futures=%d markets",
+            exchange,
+            len(spot.markets),
+            len(futures.markets),
+        )
 
     def get_spot(self, exchange: str) -> Any:
         self._ensure(exchange)
@@ -261,7 +294,7 @@ class ExchangeManager:
         if side == "buy":
             ex = self.get_spot(exchange)
             sym = symbol
-            params: dict = {}
+            params = {"category": "spot"} if exchange == "bybit" else {}
         else:
             ex = self.get_futures(exchange)
             sym = f"{symbol}:USDT"
@@ -273,8 +306,12 @@ class ExchangeManager:
                 return ex.fetch_open_order(order_id, sym, params)
             except _ccxt.OrderNotFound:
                 pass
-            except Exception:
-                pass
+            except Exception as exc:
+                _log.warning(
+                    "bybit fetch_open_order failed for %s %s (side=%s): %s — "
+                    "falling back to fetch_closed_order",
+                    exchange, order_id, side, exc,
+                )
             # Fall back to order history (filled / cancelled orders)
             try:
                 return ex.fetch_closed_order(order_id, sym, params)
@@ -296,8 +333,11 @@ class ExchangeManager:
             info.filled = float(raw.get("filled") or 0)
             info.avg_price = float(raw.get("average") or 0)
             info.cost = float(raw.get("cost") or 0)
-        except Exception:
-            pass  # keep last known state on any network / parse error
+        except Exception as exc:
+            _log.warning(
+                "refresh_order failed for order %s (%s %s): %s",
+                info.order_id, info.exchange, info.side, exc,
+            )  # keep last known state
 
     def cancel_order(
         self, exchange: str, order_id: str, ccxt_symbol: str, side: str
@@ -309,8 +349,11 @@ class ExchangeManager:
                 self.get_futures(exchange).cancel_order(
                     order_id, f"{ccxt_symbol}:USDT"
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            _log.warning(
+                "cancel_order failed for order %s (%s %s): %s",
+                order_id, exchange, side, exc,
+            )
 
     # ------------------------------------------------------------------
     # Ticker (for PnL)
