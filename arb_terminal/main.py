@@ -529,6 +529,111 @@ def run_trade_cycle(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _configured_exchanges(em: ExchangeManager) -> list[str]:
+    """Return exchanges that have non-empty API keys configured."""
+    return [
+        ex for ex, keys in em._keys.items()
+        if keys.get("apiKey") and keys.get("secret")
+    ]
+
+
+def _scan_futures_positions(em: ExchangeManager) -> list[tuple[str, dict]]:
+    """
+    Scan all configured exchanges for open futures short positions.
+    Returns list of (exchange_name, ccxt_position_dict).
+    """
+    results: list[tuple[str, dict]] = []
+    result_lock = threading.Lock()
+
+    def _scan(exch: str) -> None:
+        positions = em.fetch_open_positions(exch)
+        with result_lock:
+            for p in positions:
+                results.append((exch, p))
+
+    threads = [
+        threading.Thread(target=_scan, args=(ex,), daemon=True)
+        for ex in _configured_exchanges(em)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return results
+
+
+def _scan_spot_buy_orders(em: ExchangeManager, ccxt_symbol: str) -> list[tuple[str, dict]]:
+    """
+    Scan all configured exchanges for open + recently filled spot buy orders
+    for the given symbol. Returns list of (exchange_name, ccxt_order_dict).
+    """
+    results: list[tuple[str, dict]] = []
+    result_lock = threading.Lock()
+
+    def _scan(exch: str) -> None:
+        orders = em.fetch_recent_spot_buy_orders(exch, ccxt_symbol)
+        with result_lock:
+            for o in orders:
+                results.append((exch, o))
+
+    threads = [
+        threading.Thread(target=_scan, args=(ex,), daemon=True)
+        for ex in _configured_exchanges(em)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return results
+
+
+def _print_positions_table(positions: list[tuple[str, dict]]) -> None:
+    tbl = Table(
+        "#", "Exchange", "Symbol", "Side", "Contracts", "Entry price", "uPnL (USDT)",
+        title="Open futures positions",
+        border_style="yellow",
+        show_lines=True,
+    )
+    for i, (exch, p) in enumerate(positions, 1):
+        sym = p.get("symbol", "?")
+        side = p.get("side", "?")
+        contracts = float(p.get("contracts") or 0)
+        entry = float(p.get("entryPrice") or 0)
+        upnl = float(p.get("unrealizedPnl") or 0)
+        upnl_str = f"[green]{upnl:+.4f}[/]" if upnl >= 0 else f"[red]{upnl:+.4f}[/]"
+        tbl.add_row(
+            str(i), exch.upper(), sym, side,
+            f"{contracts:.4f}", _fmt_price(entry), upnl_str,
+        )
+    console.print(tbl)
+
+
+def _print_spot_orders_table(orders: list[tuple[str, dict]]) -> None:
+    tbl = Table(
+        "#", "Exchange", "Symbol", "Order ID",
+        "Amount", "Price", "Filled", "Avg price", "Status",
+        title="Spot buy orders (open + last 48h filled)",
+        border_style="cyan",
+        show_lines=True,
+    )
+    for i, (exch, o) in enumerate(orders, 1):
+        status = o.get("status", "?")
+        status_str = {
+            "closed": "[green]FILLED[/]",
+            "open": "[yellow]OPEN[/]",
+            "canceled": "[red]CANCELED[/]",
+        }.get(status, f"[dim]{status}[/]")
+        tbl.add_row(
+            str(i), exch.upper(), o.get("symbol", "?"), str(o.get("id", "?")),
+            f"{float(o.get('amount') or 0):.4f}",
+            _fmt_price(float(o.get("price") or 0)),
+            f"{float(o.get('filled') or 0):.4f}",
+            _fmt_price(float(o.get("average") or 0)),
+            status_str,
+        )
+    console.print(tbl)
+
+
 def recover_trade_cycle(
     em: ExchangeManager,
     executor: TradeExecutor,
@@ -539,60 +644,103 @@ def recover_trade_cycle(
     """
     Reconnect to already-open orders placed before restart.
 
-    Prompts the operator for symbol + order IDs, fetches current order state
-    from the exchange, then resumes from the fill-monitor phase onward
-    (same flow as run_trade_cycle steps 3-7).
+    Scans all configured exchanges for open futures positions, then finds
+    matching spot buy orders. Operator confirms the pair; script reconstructs
+    TradeEntry and resumes from fill-monitor → PnL monitor → close.
     """
     console.print(Rule("[yellow]RECOVERY MODE[/]"))
-    console.print("[dim]Reconnect to existing orders on exchange.[/]\n")
 
-    raw_sym = Prompt.ask("Symbol (raw, e.g. BTCUSDT)").strip().upper()
-    ccxt_sym = raw_symbol_to_ccxt(raw_sym)
+    # ── Step 1: scan futures positions ────────────────────────────────────
+    console.print("[dim]Scanning exchanges for open futures positions...[/]")
+    fut_positions = _scan_futures_positions(em)
 
-    buy_exchange = Prompt.ask("Buy (spot) exchange", default="bybit").strip().lower()
-    buy_order_id = Prompt.ask("Buy order ID").strip()
-    sell_exchange = Prompt.ask("Sell (futures) exchange", default="bybit").strip().lower()
-    sell_order_id = Prompt.ask("Sell order ID").strip()
-
-    console.print("\n[dim]Fetching orders from exchanges...[/]")
-
-    try:
-        buy_raw = em._fetch_single_order(buy_exchange, buy_order_id, ccxt_sym, "buy")
-    except Exception as exc:
-        console.print(f"[bold red]Failed to fetch buy order {buy_order_id!r}:[/] {exc}")
+    if not fut_positions:
+        console.print("[bold red]No open futures positions found on any exchange.[/]")
+        console.print("[dim]Make sure API keys are set in arb_terminal/.env[/]")
         return
 
-    try:
-        sell_raw = em._fetch_single_order(sell_exchange, sell_order_id, ccxt_sym, "sell")
-    except Exception as exc:
-        console.print(f"[bold red]Failed to fetch sell order {sell_order_id!r}:[/] {exc}")
-        return
+    _print_positions_table(fut_positions)
 
-    buy_order = OrderInfo(
-        order_id=buy_order_id,
-        exchange=buy_exchange,
-        side="buy",
-        symbol=ccxt_sym,
-        planned_price=float(buy_raw.get("price") or buy_raw.get("average") or 0),
-        planned_amount=float(buy_raw.get("amount") or 0),
-        status=buy_raw.get("status") or "open",
-        filled=float(buy_raw.get("filled") or 0),
-        avg_price=float(buy_raw.get("average") or 0),
-        cost=float(buy_raw.get("cost") or 0),
-    )
+    # Let operator pick a futures position
+    choices_f = [str(i) for i in range(1, len(fut_positions) + 1)]
+    sel_f = Prompt.ask("Select futures position", choices=choices_f)
+    sell_exchange, fut_pos = fut_positions[int(sel_f) - 1]
 
+    # Derive symbol info from the position
+    fut_sym_raw = fut_pos.get("symbol", "")          # e.g. "AIA/USDT:USDT"
+    ccxt_sym = fut_sym_raw.split(":")[0]              # → "AIA/USDT"
+    raw_sym = ccxt_sym.replace("/", "")               # → "AIAUSDT"
+
+    contracts = float(fut_pos.get("contracts") or 0)
+    entry_price = float(fut_pos.get("entryPrice") or 0)
+
+    # Build sell OrderInfo from position data (futures short has no "order" anymore)
     sell_order = OrderInfo(
-        order_id=sell_order_id,
+        order_id=str(fut_pos.get("id") or ""),
         exchange=sell_exchange,
         side="sell",
-        symbol=f"{ccxt_sym}:USDT",
-        planned_price=float(sell_raw.get("price") or sell_raw.get("average") or 0),
-        planned_amount=float(sell_raw.get("amount") or 0),
-        status=sell_raw.get("status") or "open",
-        filled=float(sell_raw.get("filled") or 0),
-        avg_price=float(sell_raw.get("average") or 0),
-        cost=float(sell_raw.get("cost") or 0),
+        symbol=fut_sym_raw,
+        planned_price=entry_price,
+        planned_amount=contracts,
+        status="closed",        # position is open = entry order was filled
+        filled=contracts,
+        avg_price=entry_price,
+        cost=contracts * entry_price,
     )
+
+    # ── Step 2: scan spot buy orders for this symbol ───────────────────────
+    console.print(f"\n[dim]Scanning spot exchanges for {ccxt_sym} buy orders...[/]")
+    spot_orders = _scan_spot_buy_orders(em, ccxt_sym)
+
+    buy_order: Optional[OrderInfo] = None
+
+    if spot_orders:
+        _print_spot_orders_table(spot_orders)
+        choices_s = [str(i) for i in range(1, len(spot_orders) + 1)] + ["manual"]
+        sel_s = Prompt.ask(
+            "Select spot buy order (or 'manual' to enter order ID)",
+            choices=choices_s,
+            default="1",
+        )
+    else:
+        console.print("[yellow]No matching spot orders found automatically.[/]")
+        sel_s = "manual"
+
+    if sel_s == "manual":
+        buy_exchange = Prompt.ask("Buy (spot) exchange", default="bybit").strip().lower()
+        buy_order_id = Prompt.ask("Buy order ID").strip()
+        console.print("[dim]Fetching order from exchange...[/]")
+        try:
+            buy_raw = em._fetch_single_order(buy_exchange, buy_order_id, ccxt_sym, "buy")
+        except Exception as exc:
+            console.print(f"[bold red]Failed to fetch buy order {buy_order_id!r}:[/] {exc}")
+            return
+        buy_order = OrderInfo(
+            order_id=buy_order_id,
+            exchange=buy_exchange,
+            side="buy",
+            symbol=ccxt_sym,
+            planned_price=float(buy_raw.get("price") or buy_raw.get("average") or 0),
+            planned_amount=float(buy_raw.get("amount") or 0),
+            status=buy_raw.get("status") or "open",
+            filled=float(buy_raw.get("filled") or 0),
+            avg_price=float(buy_raw.get("average") or 0),
+            cost=float(buy_raw.get("cost") or 0),
+        )
+    else:
+        buy_exchange, buy_raw = spot_orders[int(sel_s) - 1]
+        buy_order = OrderInfo(
+            order_id=str(buy_raw.get("id", "")),
+            exchange=buy_exchange,
+            side="buy",
+            symbol=ccxt_sym,
+            planned_price=float(buy_raw.get("price") or buy_raw.get("average") or 0),
+            planned_amount=float(buy_raw.get("amount") or 0),
+            status=buy_raw.get("status") or "open",
+            filled=float(buy_raw.get("filled") or 0),
+            avg_price=float(buy_raw.get("average") or 0),
+            cost=float(buy_raw.get("cost") or 0),
+        )
 
     entry = TradeEntry(
         adjusted_buy_price=buy_order.planned_price,
@@ -603,8 +751,7 @@ def recover_trade_cycle(
         sell_order=sell_order,
     )
 
-    # Minimal Signal reconstructed from fetched order data (for PnL and display).
-    # buy_ask / sell_bid are set to entry avg prices so spread display is meaningful.
+    # Reconstruct Signal (entry avg prices used as reference buy_ask/sell_bid)
     sig = Signal(
         symbol=ccxt_sym,
         raw_symbol=raw_sym,
@@ -621,7 +768,7 @@ def recover_trade_cycle(
         ts_signal=int(time.time() * 1000),
     )
 
-    console.print("\n[bold]Recovered order state:[/]")
+    console.print("\n[bold]Recovered position:[/]")
     console.print(build_fill_table(entry, 0))
 
     result = TradeResult(
@@ -631,7 +778,7 @@ def recover_trade_cycle(
         entry=entry,
     )
     result.open_time = time.time()
-    result.add_event("Recovery: orders fetched from exchange")
+    result.add_event("Recovery: position fetched from exchange")
 
     # ── 3. Fill monitor (skip if both already filled) ─────────────────────
     if not executor.both_filled(entry):
