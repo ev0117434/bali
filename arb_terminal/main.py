@@ -31,9 +31,9 @@ from rich.text import Text
 from rich.prompt import Confirm, Prompt
 
 import arb_terminal.config as cfg
-from arb_terminal.signal_listener import Signal, SignalListener
 from arb_terminal.trade_executor import calculate_entry_prices
-from arb_terminal.exchange_manager import ExchangeManager
+from arb_terminal.exchange_manager import ExchangeManager, OrderInfo
+from arb_terminal.signal_listener import Signal, SignalListener, raw_symbol_to_ccxt
 from arb_terminal.trade_executor import TradeEntry, TradeExecutor, TradeResult
 
 console = Console()
@@ -124,11 +124,11 @@ def build_signal_panel(
     )
     t.add_row(
         "  Buy price",
-        f"{_fmt_price(adj_buy)}  (orig {_fmt_price(sig.buy_ask)}, +0.{int(spread_reduction/2*100):02d}%)",
+        f"{_fmt_price(adj_buy)}  (orig {_fmt_price(sig.buy_ask)}, -0.{int(spread_reduction/2*100):02d}%)",
     )
     t.add_row(
         "  Sell price",
-        f"{_fmt_price(adj_sell)}  (orig {_fmt_price(sig.sell_bid)}, -0.{int(spread_reduction/2*100):02d}%)",
+        f"{_fmt_price(adj_sell)}  (orig {_fmt_price(sig.sell_bid)}, +0.{int(spread_reduction/2*100):02d}%)",
     )
     t.add_row(
         "  Buy qty ~",
@@ -525,6 +525,384 @@ def run_trade_cycle(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Recovery cycle
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _configured_exchanges(em: ExchangeManager) -> list[str]:
+    """Return exchanges that have non-empty API keys configured."""
+    return [
+        ex for ex, keys in em._keys.items()
+        if keys.get("apiKey") and keys.get("secret")
+    ]
+
+
+def _scan_futures_positions(em: ExchangeManager) -> list[tuple[str, dict]]:
+    """
+    Scan all configured exchanges for open futures short positions.
+    Returns list of (exchange_name, ccxt_position_dict).
+    """
+    results: list[tuple[str, dict]] = []
+    result_lock = threading.Lock()
+
+    def _scan(exch: str) -> None:
+        positions = em.fetch_open_positions(exch)
+        with result_lock:
+            for p in positions:
+                results.append((exch, p))
+
+    threads = [
+        threading.Thread(target=_scan, args=(ex,), daemon=True)
+        for ex in _configured_exchanges(em)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return results
+
+
+def _scan_spot_buy_orders(em: ExchangeManager, ccxt_symbol: str) -> list[tuple[str, dict]]:
+    """
+    Scan all configured exchanges for open + recently filled spot buy orders
+    for the given symbol. Returns list of (exchange_name, ccxt_order_dict).
+    """
+    results: list[tuple[str, dict]] = []
+    result_lock = threading.Lock()
+
+    def _scan(exch: str) -> None:
+        orders = em.fetch_recent_spot_buy_orders(exch, ccxt_symbol)
+        with result_lock:
+            for o in orders:
+                results.append((exch, o))
+
+    threads = [
+        threading.Thread(target=_scan, args=(ex,), daemon=True)
+        for ex in _configured_exchanges(em)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return results
+
+
+def _print_positions_table(positions: list[tuple[str, dict]]) -> None:
+    tbl = Table(
+        "#", "Exchange", "Symbol", "Side", "Contracts", "Entry price", "uPnL (USDT)",
+        title="Open futures positions",
+        border_style="yellow",
+        show_lines=True,
+    )
+    for i, (exch, p) in enumerate(positions, 1):
+        sym = p.get("symbol", "?")
+        side = p.get("side", "?")
+        contracts = float(p.get("contracts") or 0)
+        entry = float(p.get("entryPrice") or 0)
+        upnl = float(p.get("unrealizedPnl") or 0)
+        upnl_str = f"[green]{upnl:+.4f}[/]" if upnl >= 0 else f"[red]{upnl:+.4f}[/]"
+        tbl.add_row(
+            str(i), exch.upper(), sym, side,
+            f"{contracts:.4f}", _fmt_price(entry), upnl_str,
+        )
+    console.print(tbl)
+
+
+def _print_spot_orders_table(orders: list[tuple[str, dict]]) -> None:
+    tbl = Table(
+        "#", "Exchange", "Symbol", "Order ID",
+        "Amount", "Price", "Filled", "Avg price", "Status",
+        title="Spot buy orders (open + last 48h filled)",
+        border_style="cyan",
+        show_lines=True,
+    )
+    for i, (exch, o) in enumerate(orders, 1):
+        status = o.get("status", "?")
+        status_str = {
+            "closed": "[green]FILLED[/]",
+            "open": "[yellow]OPEN[/]",
+            "canceled": "[red]CANCELED[/]",
+        }.get(status, f"[dim]{status}[/]")
+        tbl.add_row(
+            str(i), exch.upper(), o.get("symbol", "?"), str(o.get("id", "?")),
+            f"{float(o.get('amount') or 0):.4f}",
+            _fmt_price(float(o.get("price") or 0)),
+            f"{float(o.get('filled') or 0):.4f}",
+            _fmt_price(float(o.get("average") or 0)),
+            status_str,
+        )
+    console.print(tbl)
+
+
+def recover_trade_cycle(
+    em: ExchangeManager,
+    executor: TradeExecutor,
+    position_size: float,
+    spread_reduction: float,
+    log_dir: Path,
+) -> None:
+    """
+    Reconnect to already-open orders placed before restart.
+
+    Scans all configured exchanges for open futures positions, then finds
+    matching spot buy orders. Operator confirms the pair; script reconstructs
+    TradeEntry and resumes from fill-monitor → PnL monitor → close.
+    """
+    console.print(Rule("[yellow]RECOVERY MODE[/]"))
+
+    # ── Step 1: scan futures positions ────────────────────────────────────
+    console.print("[dim]Scanning exchanges for open futures positions...[/]")
+    fut_positions = _scan_futures_positions(em)
+
+    if not fut_positions:
+        console.print("[bold red]No open futures positions found on any exchange.[/]")
+        console.print("[dim]Make sure API keys are set in arb_terminal/.env[/]")
+        return
+
+    _print_positions_table(fut_positions)
+
+    # Let operator pick a futures position
+    choices_f = [str(i) for i in range(1, len(fut_positions) + 1)]
+    sel_f = Prompt.ask("Select futures position", choices=choices_f)
+    sell_exchange, fut_pos = fut_positions[int(sel_f) - 1]
+
+    # Derive symbol info from the position
+    fut_sym_raw = fut_pos.get("symbol", "")          # e.g. "AIA/USDT:USDT"
+    ccxt_sym = fut_sym_raw.split(":")[0]              # → "AIA/USDT"
+    raw_sym = ccxt_sym.replace("/", "")               # → "AIAUSDT"
+
+    contracts = float(fut_pos.get("contracts") or 0)
+    entry_price = float(fut_pos.get("entryPrice") or 0)
+
+    # Build sell OrderInfo from position data (futures short has no "order" anymore)
+    sell_order = OrderInfo(
+        order_id=str(fut_pos.get("id") or ""),
+        exchange=sell_exchange,
+        side="sell",
+        symbol=fut_sym_raw,
+        planned_price=entry_price,
+        planned_amount=contracts,
+        status="closed",        # position is open = entry order was filled
+        filled=contracts,
+        avg_price=entry_price,
+        cost=contracts * entry_price,
+    )
+
+    # ── Step 2: scan spot buy orders for this symbol ───────────────────────
+    console.print(f"\n[dim]Scanning spot exchanges for {ccxt_sym} buy orders...[/]")
+    spot_orders = _scan_spot_buy_orders(em, ccxt_sym)
+
+    buy_order: Optional[OrderInfo] = None
+
+    if spot_orders:
+        _print_spot_orders_table(spot_orders)
+        choices_s = [str(i) for i in range(1, len(spot_orders) + 1)] + ["manual"]
+        sel_s = Prompt.ask(
+            "Select spot buy order (or 'manual' to enter order ID)",
+            choices=choices_s,
+            default="1",
+        )
+    else:
+        console.print("[yellow]No matching spot orders found automatically.[/]")
+        sel_s = "manual"
+
+    if sel_s == "manual":
+        buy_exchange = Prompt.ask("Buy (spot) exchange", default="bybit").strip().lower()
+        buy_order_id = Prompt.ask("Buy order ID").strip()
+        console.print("[dim]Fetching order from exchange...[/]")
+        try:
+            buy_raw = em._fetch_single_order(buy_exchange, buy_order_id, ccxt_sym, "buy")
+        except Exception as exc:
+            console.print(f"[bold red]Failed to fetch buy order {buy_order_id!r}:[/] {exc}")
+            return
+        buy_order = OrderInfo(
+            order_id=buy_order_id,
+            exchange=buy_exchange,
+            side="buy",
+            symbol=ccxt_sym,
+            planned_price=float(buy_raw.get("price") or buy_raw.get("average") or 0),
+            planned_amount=float(buy_raw.get("amount") or 0),
+            status=buy_raw.get("status") or "open",
+            filled=float(buy_raw.get("filled") or 0),
+            avg_price=float(buy_raw.get("average") or 0),
+            cost=float(buy_raw.get("cost") or 0),
+        )
+    else:
+        buy_exchange, buy_raw = spot_orders[int(sel_s) - 1]
+        buy_order = OrderInfo(
+            order_id=str(buy_raw.get("id", "")),
+            exchange=buy_exchange,
+            side="buy",
+            symbol=ccxt_sym,
+            planned_price=float(buy_raw.get("price") or buy_raw.get("average") or 0),
+            planned_amount=float(buy_raw.get("amount") or 0),
+            status=buy_raw.get("status") or "open",
+            filled=float(buy_raw.get("filled") or 0),
+            avg_price=float(buy_raw.get("average") or 0),
+            cost=float(buy_raw.get("cost") or 0),
+        )
+
+    entry = TradeEntry(
+        adjusted_buy_price=buy_order.planned_price,
+        adjusted_sell_price=sell_order.planned_price,
+        buy_amount=buy_order.planned_amount,
+        sell_amount=sell_order.planned_amount,
+        buy_order=buy_order,
+        sell_order=sell_order,
+    )
+
+    # Reconstruct Signal (entry avg prices used as reference buy_ask/sell_bid)
+    sig = Signal(
+        symbol=ccxt_sym,
+        raw_symbol=raw_sym,
+        direction="?",
+        buy_exchange=buy_exchange,
+        buy_market="spot",
+        buy_ask=buy_order.avg_price or buy_order.planned_price,
+        buy_ask_qty=0.0,
+        sell_exchange=sell_exchange,
+        sell_market="futures",
+        sell_bid=sell_order.avg_price or sell_order.planned_price,
+        sell_bid_qty=0.0,
+        spread_pct=0.0,
+        ts_signal=int(time.time() * 1000),
+    )
+
+    console.print("\n[bold]Recovered position:[/]")
+    console.print(build_fill_table(entry, 0))
+
+    result = TradeResult(
+        signal=sig,
+        position_size=position_size,
+        spread_reduction=spread_reduction,
+        entry=entry,
+    )
+    result.open_time = time.time()
+    result.add_event("Recovery: position fetched from exchange")
+
+    # ── 3. Fill monitor (skip if both already filled) ─────────────────────
+    if not executor.both_filled(entry):
+        console.print("\n[yellow]Orders not fully filled — starting fill monitor...[/]")
+        start_fill = time.time()
+        timeout_notified = False
+
+        with Live(console=console, refresh_per_second=2) as live:
+            while not executor.both_filled(entry):
+                executor.refresh_entry(entry, sig)
+                elapsed = time.time() - start_fill
+                live.update(build_fill_table(entry, elapsed))
+                time.sleep(cfg.ORDER_POLL_INTERVAL)
+
+                if elapsed > cfg.ORDER_TIMEOUT_SEC and not timeout_notified:
+                    timeout_notified = True
+                    live.stop()
+                    console.print(
+                        f"[yellow]Orders not filled after "
+                        f"{cfg.ORDER_TIMEOUT_SEC/60:.0f} min.[/]"
+                    )
+                    action = Prompt.ask(
+                        "Action", choices=["wait", "cancel"], default="wait"
+                    )
+                    if action == "cancel":
+                        executor.cancel_entry(entry, sig)
+                        result.add_event("Orders canceled by operator (timeout)")
+                        save_log(result, log_dir)
+                        return
+                    live.start()
+
+        result.add_event("Both orders filled")
+        fill_time = time.time() - start_fill
+        entry.buy_fill_time = fill_time
+        entry.sell_fill_time = fill_time
+        console.print(
+            f"\n[bold green]✓ Both orders filled[/]  "
+            f"buy avg=[white]{_fmt_price(buy_order.avg_price)}[/]  "
+            f"sell avg=[white]{_fmt_price(sell_order.avg_price)}[/]\n"
+        )
+    else:
+        console.print(
+            f"\n[bold green]✓ Both orders already filled[/]  "
+            f"buy avg=[white]{_fmt_price(buy_order.avg_price)}[/]  "
+            f"sell avg=[white]{_fmt_price(sell_order.avg_price)}[/]\n"
+        )
+
+    # ── 4. PnL monitor ───────────────────────────────────────────────────
+    close_event = threading.Event()
+
+    def _input_watcher():
+        while not close_event.is_set():
+            try:
+                line = sys.stdin.readline().strip().lower()
+                if line in ("close", "c", "q", "exit"):
+                    close_event.set()
+                    break
+            except Exception:
+                close_event.set()
+                break
+
+    watcher = threading.Thread(target=_input_watcher, daemon=True)
+    watcher.start()
+
+    pos_start = time.time()
+    with Live(console=console, refresh_per_second=1) as live:
+        while not close_event.is_set():
+            pnl = executor.fetch_pnl(entry, sig)
+            duration = time.time() - pos_start
+            live.update(build_pnl_panel(entry, sig, pnl, duration))
+            time.sleep(cfg.PNL_POLL_INTERVAL)
+
+    result.add_event("Close initiated by operator")
+
+    # ── 5. Close positions ────────────────────────────────────────────────
+    console.print(Rule("[red]Closing positions (market orders)...[/]"))
+    buy_close, sell_close = executor.close_positions(entry, sig)
+
+    if buy_close:
+        if "error" in buy_close:
+            console.print(f"[red]BUY close ERROR:[/] {buy_close['error']}")
+            result.add_event(f"BUY close error: {buy_close['error']}")
+        else:
+            avg = entry.buy_close_avg
+            console.print(
+                f"[green]BUY closed:[/] avg={_fmt_price(avg)}"
+                f"  qty={buy_close.get('filled', '?')}"
+            )
+            result.add_event(f"BUY closed @ avg {_fmt_price(avg)}")
+
+    if sell_close:
+        if "error" in sell_close:
+            console.print(f"[red]SELL close ERROR:[/] {sell_close['error']}")
+            result.add_event(f"SELL close error: {sell_close['error']}")
+        else:
+            avg = entry.sell_close_avg
+            console.print(
+                f"[green]SELL closed:[/] avg={_fmt_price(avg)}"
+                f"  qty={sell_close.get('filled', '?')}"
+            )
+            result.add_event(f"SELL closed @ avg {_fmt_price(avg)}")
+
+    result.close_time = time.time()
+    result.add_event("Positions closed")
+
+    # ── 6. Summary ────────────────────────────────────────────────────────
+    console.print()
+    t = Table.grid(padding=(0, 2))
+    t.add_column(style="bold cyan", justify="right")
+    t.add_column()
+    t.add_row("Duration", f"{result.duration_sec:.0f}s")
+    t.add_row("Spot PnL", _fmt_usdt(result.buy_pnl()))
+    t.add_row("Futures PnL", _fmt_usdt(result.sell_pnl()))
+    t.add_row("TOTAL PnL", _fmt_usdt(result.total_pnl()))
+    console.print(Panel(t, title="[bold]Trade Result[/]", border_style="green"))
+
+    # ── 7. Log ────────────────────────────────────────────────────────────
+    log_path = save_log(result, log_dir)
+    console.print(f"\n[dim]Log saved → {log_path}[/]")
+    console.print(Rule())
+    console.print(build_log(result))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -533,6 +911,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="ARB Terminal")
     parser.add_argument("--size", type=float, default=None, help="Position size USDT/leg")
     parser.add_argument("--reduction", type=float, default=None, help="Spread reduction pp")
+    parser.add_argument(
+        "--recover",
+        action="store_true",
+        help="Recovery mode: reconnect to already-open orders placed before restart",
+    )
     args = parser.parse_args()
 
     console.print(
@@ -574,6 +957,14 @@ def main() -> None:
 
     em = ExchangeManager(cfg.EXCHANGE_KEYS)
     executor = TradeExecutor(em)
+
+    # ── Recovery mode ─────────────────────────────────────────────────────
+    if args.recover:
+        try:
+            recover_trade_cycle(em, executor, position_size, spread_reduction, cfg.LOG_DIR)
+        except KeyboardInterrupt:
+            console.print("\n[bold red]Ctrl+C — recovery aborted.[/]")
+        return
 
     # ── Signal loop ───────────────────────────────────────────────────────
     for sig in listener.listen():

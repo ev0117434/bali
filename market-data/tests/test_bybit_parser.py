@@ -48,13 +48,12 @@ DELTA_MSG = {
 # ---------------------------------------------------------------------------
 class TestBybitSpotParser:
     def test_snapshot_message(self):
+        """Tickers snapshot: provides last price, bid/ask always empty (not in this topic)."""
         result = _spot_parse(SNAPSHOT_MSG)
         assert result is not None
         assert result["symbol"] == "BTCUSDT"
-        assert result["bid"] == "67234.50"
-        assert result["bid_qty"] == "1.234"
-        assert result["ask"] == "67234.80"
-        assert result["ask_qty"] == "0.567"
+        assert result["bid"] == ""
+        assert result["ask"] == ""
         assert result["last"] == "67234.60"
         assert result["ts_exchange"] == "1710412800000"
 
@@ -106,8 +105,8 @@ class TestBybitSpotParser:
         result = _spot_parse(msg)
         assert result is None
 
-    def test_missing_bid_price_defaults_to_empty(self):
-        """Partial delta update may not include all fields."""
+    def test_tickers_has_no_bid_ask(self):
+        """Bybit spot tickers topic never includes bid/ask — always empty."""
         msg = {
             "topic": "tickers.SOLUSDT",
             "type": "delta",
@@ -119,6 +118,48 @@ class TestBybitSpotParser:
         assert result["bid"] == ""
         assert result["ask"] == ""
         assert result["last"] == "150.0"
+
+    def test_orderbook1_snapshot(self):
+        """orderbook.1 snapshot provides bid/ask, last is empty."""
+        msg = {
+            "topic": "orderbook.1.BTCUSDT",
+            "type": "snapshot",
+            "ts": 1710412800000,
+            "data": {
+                "s": "BTCUSDT",
+                "b": [["67234.50", "1.234"]],
+                "a": [["67234.80", "0.567"]],
+                "u": 1,
+                "seq": 12345,
+            },
+        }
+        result = _spot_parse(msg)
+        assert result is not None
+        assert result["symbol"] == "BTCUSDT"
+        assert result["bid"] == "67234.50"
+        assert result["bid_qty"] == "1.234"
+        assert result["ask"] == "67234.80"
+        assert result["ask_qty"] == "0.567"
+        assert result["last"] == ""
+        assert result["ts_exchange"] == "1710412800000"
+
+    def test_orderbook1_deleted_level_returns_empty(self):
+        """orderbook.1 delta with size=0 means level deleted — skip bid/ask."""
+        msg = {
+            "topic": "orderbook.1.BTCUSDT",
+            "type": "delta",
+            "ts": 1710412800001,
+            "data": {"s": "BTCUSDT", "b": [["67234.50", "0"]], "a": [], "u": 2, "seq": 12346},
+        }
+        result = _spot_parse(msg)
+        assert result is not None
+        assert result["bid"] == ""
+        assert result["ask"] == ""
+
+    def test_orderbook1_unknown_topic_returns_none(self):
+        msg = {"topic": "orderbook.50.BTCUSDT", "data": {"s": "BTCUSDT", "b": [], "a": []}}
+        result = _spot_parse(msg)
+        assert result is None
 
     def test_ts_exchange_from_outer_ts(self):
         """ts_exchange comes from the outer 'ts' field, not from data."""

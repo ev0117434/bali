@@ -39,29 +39,55 @@ REDIS_KEY_PREFIX = f"md:{EXCHANGE}:{MARKET}"
 # ---------------------------------------------------------------------------
 def parse_ticker(data: dict) -> dict | None:
     """
-    Parse Bybit V5 tickers message.
-    Returns None for control messages (op=subscribe/ping/pong) and
-    non-ticker topics. Returns a flat dict on data messages.
+    Parse Bybit V5 spot message (tickers or orderbook.1).
+
+    Bybit spot `tickers` topic does not include bid/ask — only lastPrice and
+    24h stats. Best bid/ask come from the `orderbook.1` topic.
+
+    Returns None for control messages. Returns a partial dict otherwise;
+    fields not present in a given message type are returned as "" and will
+    not overwrite existing Redis values.
     """
     if data.get("op") in ("subscribe", "ping", "pong"):
         return None
 
-    if not data.get("topic", "").startswith("tickers."):
-        return None
-
+    topic = data.get("topic", "")
     d = data.get("data")
     if not d:
         return None
 
-    return {
-        "symbol":      d.get("symbol", "").upper(),
-        "bid":         d.get("bid1Price", ""),
-        "bid_qty":     d.get("bid1Size", ""),
-        "ask":         d.get("ask1Price", ""),
-        "ask_qty":     d.get("ask1Size", ""),
-        "last":        d.get("lastPrice", ""),
-        "ts_exchange": str(data.get("ts", 0)),
-    }
+    if topic.startswith("tickers."):
+        return {
+            "symbol":      d.get("symbol", "").upper(),
+            "bid":         "",
+            "bid_qty":     "",
+            "ask":         "",
+            "ask_qty":     "",
+            "last":        d.get("lastPrice", ""),
+            "ts_exchange": str(data.get("ts", 0)),
+        }
+
+    if topic.startswith("orderbook.1."):
+        symbol = d.get("s", "").upper()
+        bid, bid_qty, ask, ask_qty = "", "", "", ""
+        bids = d.get("b", [])
+        asks = d.get("a", [])
+        # Size "0" means price level deleted — skip
+        if bids and bids[0][1] != "0":
+            bid, bid_qty = bids[0][0], bids[0][1]
+        if asks and asks[0][1] != "0":
+            ask, ask_qty = asks[0][0], asks[0][1]
+        return {
+            "symbol":      symbol,
+            "bid":         bid,
+            "bid_qty":     bid_qty,
+            "ask":         ask,
+            "ask_qty":     ask_qty,
+            "last":        "",
+            "ts_exchange": str(data.get("ts", 0)),
+        }
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +242,8 @@ async def ws_worker(
 ) -> None:
     log = log.bind(conn_id=conn_id, symbols_count=len(symbols))
     writer = RedisWriter(redis_client, log)
-    sub_args = [f"tickers.{s}" for s in symbols]
+    # Two topics per symbol: tickers (last/volume) + orderbook.1 (bid/ask)
+    sub_args = [t for s in symbols for t in (f"tickers.{s}", f"orderbook.1.{s}")]
     # Bybit allows max 10 topics per subscribe message — split into batches
     sub_batches = [
         orjson.dumps({"op": "subscribe", "args": sub_args[i : i + SUB_BATCH_SIZE]}).decode()

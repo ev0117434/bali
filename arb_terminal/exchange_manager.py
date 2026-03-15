@@ -373,6 +373,65 @@ class ExchangeManager:
     # Market info helpers
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Scanning helpers (used by recovery mode)
+    # ------------------------------------------------------------------
+
+    def fetch_open_positions(self, exchange: str) -> list[dict]:
+        """
+        Return all open (non-zero) futures positions on an exchange.
+        Each dict is a ccxt-normalised position object.
+        """
+        params = {"category": "linear"} if exchange == "bybit" else {}
+        try:
+            positions = self.get_futures(exchange).fetch_positions(None, params)
+            return [p for p in positions if abs(float(p.get("contracts") or 0)) > 0]
+        except Exception as exc:
+            _log.warning("fetch_open_positions failed for %s: %s", exchange, exc)
+            return []
+
+    def fetch_recent_spot_buy_orders(
+        self, exchange: str, ccxt_symbol: str, since_hours: int = 48
+    ) -> list[dict]:
+        """
+        Return open + recently filled spot buy orders for a symbol.
+        Combines fetch_open_orders + fetch_closed_orders (last `since_hours` hours).
+        """
+        import time as _time
+
+        params = {"category": "spot"} if exchange == "bybit" else {}
+        since_ms = int((_time.time() - since_hours * 3600) * 1000)
+        results: list[dict] = []
+
+        try:
+            open_orders = self.get_spot(exchange).fetch_open_orders(
+                ccxt_symbol, params=params
+            )
+            results.extend(o for o in open_orders if o.get("side") == "buy")
+        except Exception as exc:
+            _log.debug("fetch_open_orders(%s, %s): %s", exchange, ccxt_symbol, exc)
+
+        try:
+            closed = self.get_spot(exchange).fetch_closed_orders(
+                ccxt_symbol, since=since_ms, limit=20, params=params
+            )
+            results.extend(
+                o for o in closed
+                if o.get("side") == "buy" and float(o.get("filled") or 0) > 0
+            )
+        except Exception as exc:
+            _log.debug("fetch_closed_orders(%s, %s): %s", exchange, ccxt_symbol, exc)
+
+        # deduplicate by order id
+        seen: set[str] = set()
+        unique: list[dict] = []
+        for o in results:
+            oid = str(o.get("id", ""))
+            if oid not in seen:
+                seen.add(oid)
+                unique.append(o)
+        return unique
+
     def get_min_amount(
         self, exchange: str, ccxt_symbol: str, side: str
     ) -> Optional[float]:
