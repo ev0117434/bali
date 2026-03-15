@@ -17,6 +17,12 @@ Directions:
   D: binance_spot(ask) → okx_futures(bid)
   E: okx_spot(ask)     → bybit_futures(bid)
   F: bybit_spot(ask)   → okx_futures(bid)
+  G: gate_spot(ask)    → binance_futures(bid)
+  H: binance_spot(ask) → gate_futures(bid)
+  I: gate_spot(ask)    → bybit_futures(bid)
+  J: bybit_spot(ask)   → gate_futures(bid)
+  K: gate_spot(ask)    → okx_futures(bid)
+  L: okx_spot(ask)     → gate_futures(bid)
 """
 import asyncio
 import logging
@@ -39,7 +45,8 @@ except ImportError:
     _PROM_AVAILABLE = False
 
 # ── Конфигурация ──────────────────────────────────────────────────────────────
-MIN_SPREAD_PCT    = float(os.getenv("MIN_SPREAD_PCT",    "1.0"))
+MIN_SPREAD_PCT        = float(os.getenv("MIN_SPREAD_PCT",        "1.0"))
+ANOMALY_SPREAD_PCT    = float(os.getenv("ANOMALY_SPREAD_PCT",    "300.0"))
 SCAN_INTERVAL_MS  = int(os.getenv("SCAN_INTERVAL_MS",   "200"))   # 0.2 сек
 STALE_THRESHOLD_MS = int(os.getenv("STALE_THRESHOLD_SEC", "300")) * 1000  # 5 минут
 SIGNAL_TTL        = int(os.getenv("SIGNAL_TTL",         "60"))    # Redis key TTL
@@ -58,6 +65,12 @@ PAIR_FILES = {
     "D": os.path.join(_BASE, "binance_spot_okx_futures.txt"),
     "E": os.path.join(_BASE, "okx_spot_bybit_futures.txt"),
     "F": os.path.join(_BASE, "bybit_spot_okx_futures.txt"),
+    "G": os.path.join(_BASE, "gate_spot_binance_futures.txt"),
+    "H": os.path.join(_BASE, "binance_spot_gate_futures.txt"),
+    "I": os.path.join(_BASE, "gate_spot_bybit_futures.txt"),
+    "J": os.path.join(_BASE, "bybit_spot_gate_futures.txt"),
+    "K": os.path.join(_BASE, "gate_spot_okx_futures.txt"),
+    "L": os.path.join(_BASE, "okx_spot_gate_futures.txt"),
 }
 
 _SOURCES = {
@@ -67,6 +80,12 @@ _SOURCES = {
     "D": {"buy": ("binance", "spot"),  "sell": ("okx",     "futures")},
     "E": {"buy": ("okx",     "spot"),  "sell": ("bybit",   "futures")},
     "F": {"buy": ("bybit",   "spot"),  "sell": ("okx",     "futures")},
+    "G": {"buy": ("gate",    "spot"),  "sell": ("binance", "futures")},
+    "H": {"buy": ("binance", "spot"),  "sell": ("gate",    "futures")},
+    "I": {"buy": ("gate",    "spot"),  "sell": ("bybit",   "futures")},
+    "J": {"buy": ("bybit",   "spot"),  "sell": ("gate",    "futures")},
+    "K": {"buy": ("gate",    "spot"),  "sell": ("okx",     "futures")},
+    "L": {"buy": ("okx",     "spot"),  "sell": ("gate",    "futures")},
 }
 
 # Папки
@@ -104,6 +123,12 @@ def make_signal_logger() -> logging.Logger:
     """signals/spread_signals.jsonl — один JSON на каждый новый сигнал."""
     os.makedirs(SIGNALS_DIR, exist_ok=True)
     return _rotating("ss.signals", os.path.join(SIGNALS_DIR, "spread_signals.jsonl"), _100MB, 10)
+
+
+def make_anomaly_logger() -> logging.Logger:
+    """signals/spread_signals_anomalies.jsonl — сигналы со спредом > ANOMALY_SPREAD_PCT."""
+    os.makedirs(SIGNALS_DIR, exist_ok=True)
+    return _rotating("ss.anomalies", os.path.join(SIGNALS_DIR, "spread_signals_anomalies.jsonl"), _100MB, 10)
 
 
 # ── Prometheus заглушки ───────────────────────────────────────────────────────
@@ -199,8 +224,9 @@ class SpreadScanner:
     def __init__(self, redis_client, log):
         self.redis          = redis_client
         self.log            = log                 # structlog → stdout
-        self.activity_log   = make_activity_logger()  # logs/spread_scanner.log
-        self.signal_log     = make_signal_logger()    # signals/spread_signals.jsonl
+        self.activity_log   = make_activity_logger()   # logs/spread_scanner.log
+        self.signal_log     = make_signal_logger()     # signals/spread_signals.jsonl
+        self.anomaly_log    = make_anomaly_logger()    # signals/spread_signals_anomalies.jsonl
         self._symbols: dict[str, list[str]] = {}
         self._shutdown    = asyncio.Event()
         self._reload_flag = False
@@ -282,6 +308,8 @@ class SpreadScanner:
             for sig, payload in to_write:
                 _sig_counter.labels(direction=sig["direction"]).inc()
                 self.signal_log.info(payload)    # → signals/spread_signals.jsonl
+                if sig["spread_pct"] >= ANOMALY_SPREAD_PCT:
+                    self.anomaly_log.info(payload)   # → signals/spread_signals_anomalies.jsonl
                 self.log.info(                   # → stdout
                     "spread_signal",
                     symbol=sig["symbol"],
