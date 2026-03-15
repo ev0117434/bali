@@ -1,8 +1,8 @@
 # Bali — система сбора рыночных данных
 
 Сбор best bid/ask с бирж **Binance**, **Bybit**, **OKX**, **Gate.io** через WebSocket с записью в Redis.
-Генерация и актуализация списков торговых пар для 4 бирж.
 Сканирование арбитражных спредов spot↔futures в реальном времени.
+Логирование снапшотов по каждому сигналу на протяжении 3500 секунд.
 
 ## Структура репозитория
 
@@ -28,20 +28,23 @@ bali/
 │
 ├── dictionaries/           # Генерация списков символов (запускается вручную)
 │   ├── main.py             # Оркестратор: REST → WS-валидация → combination → subscribe
-│   ├── binance/            # binance_pairs.py + binance_ws.py
-│   ├── bybit/              # bybit_pairs.py + bybit_ws.py
-│   ├── okx/                # okx_pairs.py + okx_ws.py
-│   ├── gate/               # gate_pairs.py + gate_ws.py
+│   ├── binance/
+│   ├── bybit/
+│   ├── okx/
+│   ├── gate/
 │   ├── combination/        # 12 пересечений пар между биржами
 │   └── subscribe/          # Готовые списки символов ← читают коллекторы
-│       ├── binance/
-│       ├── bybit/
-│       ├── okx/
-│       └── gate/
 │
-├── spread-scanner/         # Сканер арбитражных спредов
-│   ├── spread_scanner.py
+├── spread-scanner/         # Сканер спредов + снапшот-логгер
+│   ├── spread_scanner.py   # Арбитражный сканер → signals/spread_signals.csv
+│   ├── signal_snapshot.py  # Снапшоты по сигналу → signals/{direction}/{symbol}.csv
 │   └── tests/
+│
+├── signals/                # Создаётся при запуске
+│   ├── spread_signals.csv              # Все найденные сигналы
+│   ├── spread_signals_anomalies.csv    # Сигналы со спредом > 300%
+│   └── {direction}/                    # Снапшоты по направлению
+│       └── {SYMBOL}_{ts}.csv           # Снапшот конкретного сигнала
 │
 └── docs/                   # Документация
     ├── architecture.md
@@ -64,7 +67,7 @@ cp market-data/.env.example market-data/.env
 # 3. Обновить списки символов (первый запуск или раз в неделю)
 cd dictionaries && pip install websockets && python3 main.py && cd ..
 
-# 4. Запустить коллекторы
+# 4. Запустить все процессы
 python3 run.py
 ```
 
@@ -72,19 +75,20 @@ python3 run.py
 
 ## Компоненты
 
-| Компонент | Описание | Документация |
-|-----------|---------|-------------|
-| `market-data/` | WS-коллекторы Binance/Bybit/OKX/Gate.io, мониторы stale и latency | [market-data/README.md](market-data/README.md) |
-| `dictionaries/` | Генерация списков пар для 4 бирж через REST + WS-валидацию | [dictionaries/README.md](dictionaries/README.md) |
-| `spread-scanner/` | Сканирование арбитражных спредов spot↔futures (12 направлений) | — |
-| `docs/` | Архитектура, run.py, troubleshooting | [docs/](docs/) |
+| Компонент | Описание |
+|-----------|---------|
+| `market-data/` | WS-коллекторы Binance/Bybit/OKX/Gate.io, мониторы stale и latency |
+| `dictionaries/` | Генерация списков пар через REST + WS-валидацию (вручную) |
+| `spread-scanner/spread_scanner.py` | Сканирование арбитражных спредов spot↔futures (12 направлений) |
+| `spread-scanner/signal_snapshot.py` | Снапшоты цен по каждому сигналу каждые 0.3 сек / 3500 сек |
 
 ## Запуск с опциями
 
 ```bash
-python3 run.py                                       # все 11 процессов
-python3 run.py --no-monitors                         # только 8 коллекторов + spread_scanner
+python3 run.py                                       # все 12 процессов
+python3 run.py --no-monitors                         # без stale/latency мониторов
 python3 run.py --only binance_spot bybit_spot        # выборочно
+python3 run.py --only spread_scanner signal_snapshot # только сканер + снапшоты
 python3 run.py --logs-dir /var/log/market-data       # своя папка логов
 python3 run.py --no-cleanup                          # не очищать Redis и logs/ при старте
 ```
@@ -92,14 +96,18 @@ python3 run.py --no-cleanup                          # не очищать Redis
 ## Проверка работы
 
 ```bash
-# Redis содержит актуальные данные
+# Данные коллекторов в Redis
 redis-cli HGETALL md:binance:spot:BTCUSDT
 
-# Все тесты зелёные
-cd market-data && python3 -m pytest tests/ -q
+# Живые сигналы в канале
+redis-cli subscribe ch:spread_signals
 
-# Acceptance check
-bash market-data/tests/acceptance_check.sh
+# Файлы сигналов
+tail -f signals/spread_signals.csv
+ls signals/binance_s_bybit_f/
+
+# Тесты
+cd market-data && python3 -m pytest tests/ -q
 ```
 
 ## Обновление списков символов
