@@ -15,30 +15,32 @@
 └───────────────────────────┬──────────────────────────────────────┘
                             │ читают при старте
                             ▼
-┌─────────────────────────────────────────────────────────────┐
-│                      Биржи (WS)                             │
-│     Binance Spot   Binance Futures   Bybit Spot   Bybit Fut │
-└────────┬───────────────┬──────────────┬──────────┬──────────┘
-         │               │              │          │
-         ▼               ▼              ▼          ▼
-   binance_spot   binance_futures  bybit_spot  bybit_futures
-    (3 conn)        (3 conn)        (3 conn)    (3 conn)
-         │               │              │          │
-         └───────────────┴──────────────┴──────────┘
-                                │
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            Биржи (WS)                                       │
+│  Binance Spot  Binance Fut  Bybit Spot  Bybit Fut  OKX Spot  OKX Fut        │
+│  Gate Spot     Gate Fut                                                     │
+└────┬──────────────┬─────────────┬──────────┬──────────┬───────┬─────────────┘
+     │              │             │          │          │       │
+     ▼              ▼             ▼          ▼          ▼       ▼
+binance_spot  binance_futures  bybit_spot  bybit_fut  okx_spot  okx_fut
+gate_spot     gate_futures
+  (N conn)      (N conn)        (N conn)   (N conn)  (N conn) (N conn)
+     │              │             │          │          │       │
+     └──────────────┴─────────────┴──────────┴──────────┴───────┘
+                                    │
                     Redis Pipeline (HSET + EXPIRE + PUBLISH)
-                                │
-                          ┌─────▼──────┐
-                          │   Redis    │
-                          │            │
-                          │  md:*:*:*  │  ← Hash keys (TTL 300s)
-                          │            │
-                          └─────┬──────┘
-                                │
-               ┌────────────────┼──────────────────┐
-               │                │                   │
-         stale_monitor   latency_monitor      consumers
-          (SCAN+HGET)    (SCAN+HMGET)       (SUBSCRIBE)
+                                    │
+                              ┌─────▼──────┐
+                              │   Redis    │
+                              │            │
+                              │  md:*:*:*  │  ← Hash keys (TTL 300s)
+                              │            │
+                              └─────┬──────┘
+                                    │
+               ┌────────────────────┼──────────────────┬──────────────┐
+               │                    │                   │              │
+         stale_monitor   latency_monitor      spread_scanner      consumers
+          (SCAN+HGET)    (SCAN+HMGET)        (pipeline HMGET)   (SUBSCRIBE)
 ```
 
 ## Поток данных
@@ -69,8 +71,12 @@ Binance Spot:    ~270 / 150 = 2 соединения
 Binance Futures: ~310 / 150 = 3 соединения
 Bybit Spot:      ~310 / 150 = 3 соединения
 Bybit Futures:   ~270 / 150 = 2 соединения
+OKX Spot:        ~270 / 150 = 2 соединения  (лимит OKX: 300/conn)
+OKX Futures:     ~270 / 150 = 2 соединения
+Gate.io Spot:    ~270 / 150 = 2 соединения
+Gate.io Futures: ~270 / 150 = 2 соединения
 
-Итого: ~10 WS-соединений одновременно
+Итого: ~18 WS-соединений одновременно
 (точное число зависит от текущих subscribe/*.txt)
 ```
 
@@ -133,6 +139,31 @@ bybit_spot   ↔ okx_futures     (2 файла)
 bybit_spot   ↔ gate_futures    (2 файла)
 okx_spot     ↔ gate_futures    (2 файла)
 ```
+
+## Модуль spread-scanner
+
+Запускается автоматически через `run.py`. Сканирует 12 направлений арбитража:
+
+```
+A: binance_spot(ask) → bybit_futures(bid)
+B: bybit_spot(ask)   → binance_futures(bid)
+C: okx_spot(ask)     → binance_futures(bid)
+D: binance_spot(ask) → okx_futures(bid)
+E: okx_spot(ask)     → bybit_futures(bid)
+F: bybit_spot(ask)   → okx_futures(bid)
+G: gate_spot(ask)    → binance_futures(bid)
+H: binance_spot(ask) → gate_futures(bid)
+I: gate_spot(ask)    → bybit_futures(bid)
+J: bybit_spot(ask)   → gate_futures(bid)
+K: gate_spot(ask)    → okx_futures(bid)
+L: okx_spot(ask)     → gate_futures(bid)
+```
+
+Каждый цикл (по умолчанию 200 мс): один Redis pipeline → HMGET всех пар → расчёт спреда.
+Сигналы при спреде ≥ `MIN_SPREAD_PCT` (1.0%) записываются в `signals/spread_signals.jsonl`
+и публикуются в Redis канал `ch:spread_signals`.
+Cooldown по умолчанию: 3600 сек на (direction, symbol).
+Поддерживает SIGHUP для перезагрузки файлов символов без перезапуска.
 
 ## Отказоустойчивость
 

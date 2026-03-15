@@ -1,13 +1,14 @@
 # Bali — система сбора рыночных данных
 
-Сбор best bid/ask с бирж **Binance**, **Bybit** через WebSocket с записью в Redis.
-Генерация и актуализация списков торговых пар для 4 бирж: **Binance**, **Bybit**, **OKX**, **Gate.io**.
+Сбор best bid/ask с бирж **Binance**, **Bybit**, **OKX**, **Gate.io** через WebSocket с записью в Redis.
+Генерация и актуализация списков торговых пар для 4 бирж.
+Сканирование арбитражных спредов spot↔futures в реальном времени.
 
 ## Структура репозитория
 
 ```
 bali/
-├── run.py                  # Единая точка запуска всех процессов market-data
+├── run.py                  # Единая точка запуска всех процессов
 │
 ├── market-data/            # WS-коллекторы и мониторы → пишут в Redis
 │   ├── common.py
@@ -15,6 +16,10 @@ bali/
 │   ├── binance_futures.py
 │   ├── bybit_spot.py
 │   ├── bybit_futures.py
+│   ├── okx_spot.py
+│   ├── okx_futures.py
+│   ├── gate_spot.py
+│   ├── gate_futures.py
 │   ├── stale_monitor.py
 │   ├── latency_monitor.py
 │   ├── requirements.txt
@@ -69,18 +74,19 @@ python3 run.py
 
 | Компонент | Описание | Документация |
 |-----------|---------|-------------|
-| `market-data/` | WS-коллекторы Binance/Bybit, мониторы stale и latency | [market-data/README.md](market-data/README.md) |
+| `market-data/` | WS-коллекторы Binance/Bybit/OKX/Gate.io, мониторы stale и latency | [market-data/README.md](market-data/README.md) |
 | `dictionaries/` | Генерация списков пар для 4 бирж через REST + WS-валидацию | [dictionaries/README.md](dictionaries/README.md) |
-| `spread-scanner/` | Сканирование арбитражных спредов spot↔futures | — |
+| `spread-scanner/` | Сканирование арбитражных спредов spot↔futures (12 направлений) | — |
 | `docs/` | Архитектура, run.py, troubleshooting | [docs/](docs/) |
 
 ## Запуск с опциями
 
 ```bash
-python3 run.py                                       # все 6 процессов
-python3 run.py --no-monitors                         # только 4 коллектора
+python3 run.py                                       # все 11 процессов
+python3 run.py --no-monitors                         # только 8 коллекторов + spread_scanner
 python3 run.py --only binance_spot bybit_spot        # выборочно
 python3 run.py --logs-dir /var/log/market-data       # своя папка логов
+python3 run.py --no-cleanup                          # не очищать Redis и logs/ при старте
 ```
 
 ## Проверка работы

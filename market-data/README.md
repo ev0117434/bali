@@ -24,6 +24,10 @@ market-data/
 ├── binance_futures.py  # Binance Futures bookTicker → Redis
 ├── bybit_spot.py       # Bybit Spot tickers → Redis
 ├── bybit_futures.py    # Bybit Linear Futures tickers → Redis
+├── okx_spot.py         # OKX Spot tickers → Redis
+├── okx_futures.py      # OKX Swap (Futures) tickers → Redis
+├── gate_spot.py        # Gate.io Spot book_ticker → Redis
+├── gate_futures.py     # Gate.io Futures book_ticker → Redis
 ├── stale_monitor.py    # обнаружение устаревших символов
 ├── latency_monitor.py  # мониторинг задержек pipeline
 ├── requirements.txt
@@ -33,6 +37,8 @@ market-data/
     ├── test_common.py
     ├── test_binance_parser.py
     ├── test_bybit_parser.py
+    ├── test_okx_parser.py
+    ├── test_gate_parser.py
     ├── test_stale_monitor.py
     ├── test_latency_monitor.py
     ├── test_redis_write.py
@@ -53,10 +59,10 @@ cp .env.example .env
 |-----------|-------------|---------|
 | `REDIS_URL` | `redis://localhost:6379/0` | Подключение к Redis |
 | `REDIS_KEY_TTL` | `300` | TTL ключей в секундах. Должен быть > `STALE_THRESHOLD_SEC` |
-| `SYMBOLS_PER_CONN` | `150` | Символов на одно WS-соединение (лимит биржи 200) |
+| `SYMBOLS_PER_CONN` | `150` | Символов на одно WS-соединение (лимит биржи 200; OKX лимит 300) |
 | `WS_RECV_TIMEOUT` | `60` | Таймаут получения данных (сек), после которого reconnect |
 | `RECONNECT_MAX_DELAY` | `60` | Максимальная задержка backoff (сек) |
-| `WS_PING_INTERVAL` | `30` | Интервал ping (Binance=30, Bybit=20, задаётся per-script) |
+| `WS_PING_INTERVAL` | `30` | Интервал ping (Binance=30, Bybit=20, OKX=25, Gate.io=20) |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL` |
 | `STALE_THRESHOLD_SEC` | `60` | Возраст данных (сек), после которого символ считается stale |
 | `SCAN_INTERVAL_SEC` | `30` | Интервал сканирования stale_monitor |
@@ -84,7 +90,7 @@ ws_worker(chunk, conn_id)
  └── loop:
       ├── websockets.connect()
       ├── subscribe(symbols)
-      ├── ping_task (Bybit: каждые 20 сек)
+      ├── ping_task (Bybit/OKX/Gate.io: ручной ping)
       ├── read loop:
       │    ├── wait_for(ws.recv(), timeout=WS_RECV_TIMEOUT)
       │    ├── orjson.loads()
@@ -122,6 +128,10 @@ md:{exchange}:{market}:{symbol}
   md:binance:futures:ETHUSDT
   md:bybit:spot:SOLUSDT
   md:bybit:futures:BTCUSDT
+  md:okx:spot:BTCUSDT
+  md:okx:futures:ETHUSDT
+  md:gate:spot:BTCUSDT
+  md:gate:futures:SOLUSDT
 ```
 
 ### Поля Hash
@@ -132,7 +142,7 @@ md:{exchange}:{market}:{symbol}
 | `bid_qty` | str | Best bid quantity |
 | `ask` | str | Best ask price |
 | `ask_qty` | str | Best ask quantity |
-| `last` | str | Last trade price (пусто у Binance) |
+| `last` | str | Last trade price (пусто у Binance Spot и Gate.io) |
 | `ts_exchange` | str (ms) | Timestamp от биржи (`"0"` для Binance Spot — не передаётся) |
 | `ts_received` | str (ms) | Timestamp получения WS-сообщения коллектором |
 | `ts_redis` | str (ms) | Timestamp записи в Redis |
@@ -167,6 +177,7 @@ redis-cli TTL md:binance:spot:BTCUSDT
 - **Символы в params:** lowercase + `@bookTicker`
 - **Ping:** websockets обрабатывает автоматически (`ping_interval=30`)
 - **ts_exchange:** всегда `"0"` — bookTicker Spot не содержит timestamp биржи
+- **last:** всегда пустая строка
 
 ### Binance Futures (`binance_futures.py`)
 
@@ -186,6 +197,39 @@ redis-cli TTL md:binance:spot:BTCUSDT
 
 - **URL:** `wss://stream.bybit.com/v5/public/linear`
 - Формат данных и логика идентичны Bybit Spot
+
+### OKX Spot (`okx_spot.py`)
+
+- **URL:** `wss://ws.okx.com:8443/ws/v5/public`
+- **Подписка:** `{"op":"subscribe","args":[{"channel":"tickers","instId":"BTC-USDT"},...]}`
+- **Символы:** нормализованный BTCUSDT конвертируется в нативный BTC-USDT для подписки
+- **Ping:** plain text `"ping"`, ответ: plain text `"pong"`, интервал 25 сек
+- **ts_exchange:** поле `ts` внутри объекта данных (в ms)
+- До 300 instId на одно соединение
+
+### OKX Futures (`okx_futures.py`)
+
+- **URL:** `wss://ws.okx.com:8443/ws/v5/public`
+- **instId формат:** `BTC-USDT-SWAP`
+- Формат данных и логика идентичны OKX Spot
+
+### Gate.io Spot (`gate_spot.py`)
+
+- **URL:** `wss://api.gateio.ws/ws/v4/`
+- **Канал:** `spot.book_ticker`
+- **Подписка:** `{"time":ts,"channel":"spot.book_ticker","event":"subscribe","payload":[...]}`
+- **Символы:** нормализованный BTCUSDT конвертируется в нативный BTC_USDT для подписки
+- **Ping:** JSON `{"time":ts,"channel":"spot.ping"}`, интервал 20 сек
+- **ts_exchange:** поле `time` внешней обёртки (epoch seconds × 1000)
+- **last:** всегда пустая строка (Gate.io book_ticker не передаёт last price)
+- Подписка батчами по 100 символов
+
+### Gate.io Futures (`gate_futures.py`)
+
+- **URL:** `wss://fx-ws.gateio.ws/v4/ws/usdt`
+- **Канал:** `futures.book_ticker`
+- **Ping:** JSON `{"time":ts,"channel":"futures.ping"}`
+- Формат данных идентичен Gate.io Spot
 
 ---
 
@@ -293,7 +337,7 @@ redis-cli TTL md:binance:spot:BTCUSDT
 | WS disconnect | Reconnect с exponential backoff | WARNING `ws_reconnecting` |
 | WS recv timeout | Reconnect | WARNING `ws_recv_timeout` |
 | JSON parse error | Skip сообщение | WARNING `message_parse_error` |
-| Неизвестный формат | Skip сообщение | WARNING (молча, нет лога) |
+| Неизвестный формат | Skip сообщение | — |
 | Redis down | Буфер до 1000 записей, retry при следующей записи | ERROR `redis_error` |
 | Redis recovered | Сброс буфера в Redis | INFO `redis_recovered` |
 | Буфер переполнен | DROP oldest | WARNING `redis_buffer_full` |
@@ -305,7 +349,7 @@ redis-cli TTL md:binance:spot:BTCUSDT
 ## Тесты
 
 ```bash
-# Все тесты (102 штуки, fakeredis — реальный Redis не нужен)
+# Все тесты (fakeredis — реальный Redis не нужен)
 python3 -m pytest tests/ -v
 
 # С покрытием
@@ -322,6 +366,8 @@ bash tests/acceptance_check.sh
 | `test_common.py` | 18 | `load_symbols` edge cases, `now_ms`, structlog binding |
 | `test_binance_parser.py` | 18 | Парсер Spot/Futures, reconnect backoff формула |
 | `test_bybit_parser.py` | 17 | Snapshot/delta, ping/pong, все граничные случаи |
+| `test_okx_parser.py` | — | Парсер OKX tickers, нормализация instId, ping/pong |
+| `test_gate_parser.py` | — | Парсер Gate.io book_ticker, конвертация ts, нативный формат |
 | `test_stale_monitor.py` | 9 | Grace period, recovery, pub/sub формат алерта |
 | `test_latency_monitor.py` | 20 | `calc_stats`, `parse_latencies`, пороги аномалий |
 | `test_redis_write.py` | 20 | Формат ключей, 8 полей, TTL, pub/sub, буфер |
