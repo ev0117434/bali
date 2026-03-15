@@ -23,8 +23,14 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 import logging
 
-MARKET_DATA_DIR = os.path.join(os.path.dirname(__file__), "market-data")
+MARKET_DATA_DIR   = os.path.join(os.path.dirname(__file__), "market-data")
+SPREAD_SCANNER_DIR = os.path.join(os.path.dirname(__file__), "spread-scanner")
 LOGS_DIR = os.path.join(os.path.dirname(__file__), "logs")
+
+# Директория скрипта (по умолчанию MARKET_DATA_DIR, кроме исключений)
+SCRIPT_DIRS = {
+    "spread_scanner": SPREAD_SCANNER_DIR,
+}
 
 # Ротация: 50 МБ на файл, 5 архивов → макс 300 МБ на скрипт
 LOG_MAX_BYTES = 50 * 1024 * 1024
@@ -37,6 +43,7 @@ SCRIPTS = [
     "bybit_futures",
     "stale_monitor",
     "latency_monitor",
+    "spread_scanner",
 ]
 
 MONITORS = {"stale_monitor", "latency_monitor"}
@@ -50,6 +57,7 @@ COLORS = {
     "bybit_futures":   "\033[93m",  # жёлтый
     "stale_monitor":   "\033[95m",  # фиолетовый
     "latency_monitor": "\033[91m",  # красный
+    "spread_scanner":  "\033[33m",  # оранжевый
 }
 RESET = "\033[0m"
 
@@ -96,7 +104,7 @@ def main():
     parser = argparse.ArgumentParser(description="Market Data Collector launcher")
     parser.add_argument(
         "--only", nargs="+", metavar="SCRIPT",
-        help=f"Запустить только указанные скрипты. Доступные: {', '.join(SCRIPTS)}"
+        help=f"Запустить только указанные скрипты. Доступные: {', '.join(SCRIPTS)}",
     )
     parser.add_argument(
         "--no-monitors", action="store_true",
@@ -141,19 +149,23 @@ def main():
 
     # Запускаем процессы
     for name in to_run:
-        script_path = os.path.join(MARKET_DATA_DIR, f"{name}.py")
+        script_dir = SCRIPT_DIRS.get(name, MARKET_DATA_DIR)
+        script_path = os.path.join(script_dir, f"{name}.py")
         if not os.path.exists(script_path):
             print(f"[WARN] {script_path} не найден, пропускаем", file=sys.stderr)
             continue
 
         env = os.environ.copy()
-        env["PYTHONPATH"] = MARKET_DATA_DIR + os.pathsep + env.get("PYTHONPATH", "")
+        # Оба каталога в PYTHONPATH — spread_scanner импортирует common из market-data
+        env["PYTHONPATH"] = (
+            script_dir + os.pathsep + MARKET_DATA_DIR + os.pathsep + env.get("PYTHONPATH", "")
+        )
 
         proc = subprocess.Popen(
             [sys.executable, script_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,  # stderr → в тот же поток
-            cwd=MARKET_DATA_DIR,
+            cwd=script_dir,
             env=env,
         )
         processes[name] = proc
