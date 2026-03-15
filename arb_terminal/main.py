@@ -528,8 +528,6 @@ def main() -> None:
     parser.add_argument("--reduction", type=float, default=None, help="Spread reduction pp")
     args = parser.parse_args()
 
-    signal.signal(signal.SIGINT, _sigint)
-
     console.print(
         Panel(
             "[bold white]ARB TERMINAL[/]\n"
