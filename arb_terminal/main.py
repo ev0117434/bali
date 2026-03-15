@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import logging
 import sys
 import time
 import threading
@@ -36,6 +37,12 @@ from arb_terminal.exchange_manager import ExchangeManager
 from arb_terminal.trade_executor import TradeEntry, TradeExecutor, TradeResult
 
 console = Console()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(name)s  %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
