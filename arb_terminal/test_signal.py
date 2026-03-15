@@ -89,7 +89,9 @@ def main() -> None:
     parser.add_argument("--buy-exchange", default="binance")
     parser.add_argument("--sell-exchange", default="gate")
     parser.add_argument("--symbol", default="THEUSDT")
-    parser.add_argument("--spread", type=float, default=None, help="Override spread %")
+    parser.add_argument("--buy-ask", type=float, default=None, help="Best ask on buy exchange")
+    parser.add_argument("--sell-bid", type=float, default=None, help="Best bid on sell exchange")
+    parser.add_argument("--spread", type=float, default=None, help="Override spread % (ignored if --buy-ask/--sell-bid set)")
     parser.add_argument("--repeat", type=float, default=None, help="Repeat every N seconds")
     parser.add_argument("--channel", default=cfg.REDIS_CHANNEL)
     parser.add_argument("--host", default=cfg.REDIS_HOST)
@@ -104,11 +106,11 @@ def main() -> None:
         sys.exit(1)
 
     preset = PRESETS.get(args.symbol.upper(), PRESETS["THEUSDT"])
-    buy_ask = preset["buy_ask"]
-    sell_bid = preset["sell_bid"]
+    buy_ask = args.buy_ask if args.buy_ask is not None else preset["buy_ask"]
+    sell_bid = args.sell_bid if args.sell_bid is not None else preset["sell_bid"]
 
-    # Apply custom spread if given
-    if args.spread is not None:
+    # --spread overrides only if explicit prices not given
+    if args.spread is not None and args.buy_ask is None and args.sell_bid is None:
         sell_bid = buy_ask * (1 + args.spread / 100)
 
     buy_ask_qty = preset["buy_ask_qty"]
