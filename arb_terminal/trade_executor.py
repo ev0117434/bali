@@ -336,6 +336,42 @@ class TradeExecutor:
     # Close (parallel market orders)
     # ------------------------------------------------------------------
 
+    # Fee buffer applied when closing spot long.
+    # Binance (and most spot exchanges) deduct ~0.1% fee from received tokens,
+    # so we actually hold slightly less than `filled`. Selling `filled` causes
+    # "insufficient balance". Reducing by FEE_BUFFER avoids this.
+    SPOT_CLOSE_FEE_BUFFER = 0.999  # sell 99.9% of filled amount
+
+    def _close_amount_spot(self, exchange: str, symbol: str, filled: float) -> float:
+        """Return amount to use for spot market-sell, rounded to precision."""
+        raw = filled * self.SPOT_CLOSE_FEE_BUFFER
+        try:
+            return float(self.em.get_spot(exchange).amount_to_precision(symbol, raw))
+        except Exception:
+            return raw
+
+    def _refetch_close_avg(self, raw_order: dict, exchange: str,
+                           symbol: str, side: str) -> float:
+        """
+        Market orders on some exchanges (Bybit) return average=None immediately
+        because the fill is processed asynchronously. Wait briefly and re-fetch.
+        """
+        avg = float(raw_order.get("average") or raw_order.get("price") or 0)
+        if avg:
+            return avg
+        order_id = raw_order.get("id")
+        if not order_id:
+            return 0.0
+        time.sleep(1.0)
+        try:
+            refreshed = self.em._fetch_single_order(
+                exchange, str(order_id), symbol, side
+            )
+            avg = float(refreshed.get("average") or refreshed.get("price") or 0)
+        except Exception:
+            pass
+        return avg
+
     def close_positions(
         self, entry: TradeEntry, signal: Signal
     ) -> Tuple[Optional[dict], Optional[dict]]:
@@ -350,8 +386,11 @@ class TradeExecutor:
             bo = entry.buy_order
             if bo and bo.filled > 0:
                 try:
+                    close_amt = self._close_amount_spot(
+                        bo.exchange, signal.symbol, bo.filled
+                    )
                     buy_raw[0] = self.em.place_market_close(
-                        bo.exchange, signal.symbol, "buy", bo.filled
+                        bo.exchange, signal.symbol, "buy", close_amt
                     )
                 except Exception as exc:
                     buy_raw[0] = {"error": str(exc)}
@@ -373,14 +412,16 @@ class TradeExecutor:
         t1.join()
         t2.join()
 
-        # Extract average prices for PnL
+        # Extract average prices for PnL (re-fetch if exchange returned None)
+        bo = entry.buy_order
+        so = entry.sell_order
         if buy_raw[0] and "error" not in buy_raw[0]:
-            entry.buy_close_avg = float(
-                buy_raw[0].get("average") or buy_raw[0].get("price") or 0
+            entry.buy_close_avg = self._refetch_close_avg(
+                buy_raw[0], bo.exchange, signal.symbol, "buy"
             )
         if sell_raw[0] and "error" not in sell_raw[0]:
-            entry.sell_close_avg = float(
-                sell_raw[0].get("average") or sell_raw[0].get("price") or 0
+            entry.sell_close_avg = self._refetch_close_avg(
+                sell_raw[0], so.exchange, signal.symbol, "sell"
             )
 
         return buy_raw[0], sell_raw[0]

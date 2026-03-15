@@ -477,7 +477,7 @@ def run_trade_cycle(
             console.print(f"[red]BUY close ERROR:[/] {buy_close['error']}")
             result.add_event(f"BUY close error: {buy_close['error']}")
         else:
-            avg = float(buy_close.get("average") or buy_close.get("price") or 0)
+            avg = entry.buy_close_avg  # already re-fetched in close_positions
             console.print(
                 f"[green]BUY closed:[/] avg={_fmt_price(avg)}"
                 f"  qty={buy_close.get('filled', '?')}"
@@ -489,7 +489,7 @@ def run_trade_cycle(
             console.print(f"[red]SELL close ERROR:[/] {sell_close['error']}")
             result.add_event(f"SELL close error: {sell_close['error']}")
         else:
-            avg = float(sell_close.get("average") or sell_close.get("price") or 0)
+            avg = entry.sell_close_avg  # already re-fetched in close_positions
             console.print(
                 f"[green]SELL closed:[/] avg={_fmt_price(avg)}"
                 f"  qty={sell_close.get('filled', '?')}"
