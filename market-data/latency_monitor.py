@@ -104,7 +104,8 @@ async def run(redis_client, shutdown_event: asyncio.Event, log):
 
             c2r_by_market[market_key].append(lats["collector_to_redis"])
 
-            if lats["end_to_end"] is not None:
+            symbol = parts[3] if len(parts) > 3 else ""
+            if symbol == "BTCUSDT" and lats["end_to_end"] is not None:
                 e2e_val = lats["end_to_end"]
                 e2e_by_market[market_key].append(e2e_val)
 
