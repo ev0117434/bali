@@ -1,0 +1,6 @@
+redis>=5.0
+ccxt>=4.3
+rich>=13.7
+python-dotenv>=1.0
+pytest>=8.0
+pytest-mock>=3.12
