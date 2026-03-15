@@ -93,18 +93,13 @@ class ExchangeManager:
         spot_cfg = {**base, "options": {"defaultType": "spot"}}
         fut_cfg = {**base, "options": {"defaultType": "swap"}}
 
-        # Testnet support
-        if keys.get("testnet"):
-            if exchange == "binance":
-                spot_cfg["options"]["defaultType"] = "spot"
-                spot_cfg["urls"] = {"api": {"public": "https://testnet.binance.vision/api", "private": "https://testnet.binance.vision/api"}}
-                fut_cfg["urls"] = {"api": {"public": "https://testnet.binancefuture.com", "private": "https://testnet.binancefuture.com"}}
-            elif exchange == "bybit":
-                spot_cfg["options"]["testnet"] = True
-                fut_cfg["options"]["testnet"] = True
-
         spot = ExClass(spot_cfg)
         futures = ExClass(fut_cfg)
+
+        # Testnet / sandbox via ccxt built-in (works for Binance, Bybit)
+        if keys.get("testnet"):
+            spot.set_sandbox_mode(True)
+            futures.set_sandbox_mode(True)
 
         spot.load_markets()
         futures.load_markets()
