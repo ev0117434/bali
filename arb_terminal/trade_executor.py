@@ -288,12 +288,19 @@ class TradeExecutor:
             "buy_pnl": 0.0,  "sell_pnl": 0.0,
             "total_pnl": 0.0, "current_spread_pct": 0.0,
         }
+        def _price(ticker: dict, key: str) -> float:
+            """bid/ask may be None on some exchanges — fall back to last."""
+            v = ticker.get(key)
+            if v:
+                return float(v)
+            return float(ticker.get("last") or 0)
+
         try:
             spot_ticker = self.em.fetch_ticker(
                 signal.buy_exchange, signal.symbol, "buy"
             )
-            result["spot_bid"] = float(spot_ticker.get("bid") or 0)
-            result["spot_ask"] = float(spot_ticker.get("ask") or 0)
+            result["spot_bid"] = _price(spot_ticker, "bid")
+            result["spot_ask"] = _price(spot_ticker, "ask")
         except Exception:
             pass
 
@@ -301,8 +308,8 @@ class TradeExecutor:
             fut_ticker = self.em.fetch_ticker(
                 signal.sell_exchange, signal.symbol, "sell"
             )
-            result["fut_bid"] = float(fut_ticker.get("bid") or 0)
-            result["fut_ask"] = float(fut_ticker.get("ask") or 0)
+            result["fut_bid"] = _price(fut_ticker, "bid")
+            result["fut_ask"] = _price(fut_ticker, "ask")
         except Exception:
             pass
 

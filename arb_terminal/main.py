@@ -31,7 +31,8 @@ from rich.text import Text
 from rich.prompt import Confirm, Prompt
 
 import arb_terminal.config as cfg
-from arb_terminal.signal_listener import Signal, SignalListener, calculate_entry_prices
+from arb_terminal.signal_listener import Signal, SignalListener
+from arb_terminal.trade_executor import calculate_entry_prices
 from arb_terminal.exchange_manager import ExchangeManager
 from arb_terminal.trade_executor import TradeEntry, TradeExecutor, TradeResult
 
