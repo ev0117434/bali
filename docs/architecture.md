@@ -3,10 +3,22 @@
 ## Обзор
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                      Биржи (WS)                         │
-│  Binance Spot   Binance Futures   Bybit Spot   Bybit Fut │
-└────────┬───────────────┬──────────────┬──────────┬──────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                    dictionaries/main.py                          │
+│  (запускается вручную, обновляет списки символов)                │
+│                                                                  │
+│  Binance REST+WS  Bybit REST+WS  OKX REST+WS  Gate.io REST+WS   │
+│        ↓                ↓             ↓              ↓           │
+│   combination/      (12 пересечений пар между биржами)           │
+│        ↓                                                         │
+│   subscribe/        binance/ bybit/ okx/ gate/                   │
+└───────────────────────────┬──────────────────────────────────────┘
+                            │ читают при старте
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      Биржи (WS)                             │
+│     Binance Spot   Binance Futures   Bybit Spot   Bybit Fut │
+└────────┬───────────────┬──────────────┬──────────┬──────────┘
          │               │              │          │
          ▼               ▼              ▼          ▼
    binance_spot   binance_futures  bybit_spot  bybit_futures
@@ -53,15 +65,74 @@ write_redis() — pipeline:
 ```
 N символов / SYMBOLS_PER_CONN(150) = K соединений
 
-Binance Spot:    446 / 150 = 3 соединения (150 + 150 + 146)
-Binance Futures: 401 / 150 = 3 соединения (150 + 150 + 101)
-Bybit Spot:      392 / 150 = 3 соединения (150 + 150 + 92)
-Bybit Futures:   391 / 150 = 3 соединения (150 + 150 + 91)
+Binance Spot:    ~270 / 150 = 2 соединения
+Binance Futures: ~310 / 150 = 3 соединения
+Bybit Spot:      ~310 / 150 = 3 соединения
+Bybit Futures:   ~270 / 150 = 2 соединения
 
-Итого: 12 WS-соединений одновременно
+Итого: ~10 WS-соединений одновременно
+(точное число зависит от текущих subscribe/*.txt)
 ```
 
 Каждое соединение — отдельная asyncio.Task. Падение одного не влияет на остальные.
+
+## Модуль dictionaries
+
+Запускается вручную (`python3 dictionaries/main.py`) для актуализации списков символов.
+Коллекторы `market-data/` читают результат при каждом старте.
+
+### Пайплайн
+
+```
+1. REST API (4 биржи параллельно)
+      Binance /exchangeInfo
+      Bybit   /instruments-info
+      OKX     /instruments
+      Gate.io /currency_pairs + /contracts
+          ↓
+   Все USDT/USDC пары → сохранить в {exchange}/data/
+
+2. WebSocket-валидация (4 биржи параллельно, 60 сек)
+      Подписка на все пары → наблюдение
+      Фиксируем пары, давшие хоть 1 ответ
+          ↓
+   Активные пары → {exchange}/data/{exchange}_{market}_active.txt
+
+3. Пересечения (12 комбинаций)
+      Для каждой пары бирж: A_spot ∩ B_futures
+          ↓
+   combination/*.txt
+
+4. Subscribe-файлы (8 файлов)
+      Из combination-файлов по ключевым словам в имени
+          ↓
+   subscribe/{exchange}/{exchange}_{market}.txt
+```
+
+### Нормализация форматов
+
+| Биржа | Нативный формат | Нормализованный |
+|-------|----------------|----------------|
+| Binance | `BTCUSDT` | `BTCUSDT` (без изменений) |
+| Bybit | `BTCUSDT` | `BTCUSDT` (без изменений) |
+| OKX | `BTC-USDT`, `BTC-USDT-SWAP` | `BTCUSDT` |
+| Gate.io | `BTC_USDT` | `BTCUSDT` |
+
+OKX и Gate.io хранят нативные символы в отдельных файлах — они нужны для WS-подписки.
+Во всех остальных местах (combination, subscribe) используется нормализованный формат.
+
+### Комбинации
+
+12 пересечений: все возможные пары из 4 бирж × 2 рынка:
+
+```
+binance_spot ↔ bybit_futures   (2 файла: bsbyf + bysbf)
+binance_spot ↔ okx_futures     (2 файла)
+binance_spot ↔ gate_futures    (2 файла)
+bybit_spot   ↔ okx_futures     (2 файла)
+bybit_spot   ↔ gate_futures    (2 файла)
+okx_spot     ↔ gate_futures    (2 файла)
+```
 
 ## Отказоустойчивость
 
@@ -92,4 +163,5 @@ latency_monitor ─SCAN─► Redis ──ts fields──► stats(min/avg/p95) 
 
 - **Несколько Redis** — изменить `REDIS_URL` в каждом скрипте. Коллекторы stateless.
 - **Разделение символов** — отредактировать `subscribe/*.txt` файлы, запустить несколько экземпляров.
-- **Добавить биржу** — новый коллектор по аналогии с существующими + новые файлы в `dictionaries/subscribe/`.
+- **Добавить биржу в market-data** — новый коллектор по аналогии с существующими.
+- **Добавить биржу в dictionaries** — новая папка `{exchange}/` с `*_pairs.py` и `*_ws.py`, добавить в `COMBINATIONS` и `SUBSCRIBE_MAP` в `main.py`.
