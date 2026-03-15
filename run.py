@@ -43,6 +43,8 @@ SCRIPTS = [
     "bybit_futures",
     "okx_spot",
     "okx_futures",
+    "gate_spot",
+    "gate_futures",
     "stale_monitor",
     "latency_monitor",
     "spread_scanner",
@@ -59,6 +61,8 @@ COLORS = {
     "bybit_futures":   "\033[93m",  # жёлтый
     "okx_spot":        "\033[97m",  # белый
     "okx_futures":     "\033[37m",  # светло-серый
+    "gate_spot":       "\033[32m",  # тёмно-зелёный
+    "gate_futures":    "\033[36m",  # циан
     "stale_monitor":   "\033[95m",  # фиолетовый
     "latency_monitor": "\033[91m",  # красный
     "spread_scanner":  "\033[33m",  # оранжевый

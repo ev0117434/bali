@@ -17,6 +17,12 @@ Directions:
   D: binance_spot(ask) → okx_futures(bid)
   E: okx_spot(ask)     → bybit_futures(bid)
   F: bybit_spot(ask)   → okx_futures(bid)
+  G: gate_spot(ask)    → binance_futures(bid)
+  H: binance_spot(ask) → gate_futures(bid)
+  I: gate_spot(ask)    → bybit_futures(bid)
+  J: bybit_spot(ask)   → gate_futures(bid)
+  K: gate_spot(ask)    → okx_futures(bid)
+  L: okx_spot(ask)     → gate_futures(bid)
 """
 import asyncio
 import logging
@@ -58,6 +64,12 @@ PAIR_FILES = {
     "D": os.path.join(_BASE, "binance_spot_okx_futures.txt"),
     "E": os.path.join(_BASE, "okx_spot_bybit_futures.txt"),
     "F": os.path.join(_BASE, "bybit_spot_okx_futures.txt"),
+    "G": os.path.join(_BASE, "gate_spot_binance_futures.txt"),
+    "H": os.path.join(_BASE, "binance_spot_gate_futures.txt"),
+    "I": os.path.join(_BASE, "gate_spot_bybit_futures.txt"),
+    "J": os.path.join(_BASE, "bybit_spot_gate_futures.txt"),
+    "K": os.path.join(_BASE, "gate_spot_okx_futures.txt"),
+    "L": os.path.join(_BASE, "okx_spot_gate_futures.txt"),
 }
 
 _SOURCES = {
@@ -67,6 +79,12 @@ _SOURCES = {
     "D": {"buy": ("binance", "spot"),  "sell": ("okx",     "futures")},
     "E": {"buy": ("okx",     "spot"),  "sell": ("bybit",   "futures")},
     "F": {"buy": ("bybit",   "spot"),  "sell": ("okx",     "futures")},
+    "G": {"buy": ("gate",    "spot"),  "sell": ("binance", "futures")},
+    "H": {"buy": ("binance", "spot"),  "sell": ("gate",    "futures")},
+    "I": {"buy": ("gate",    "spot"),  "sell": ("bybit",   "futures")},
+    "J": {"buy": ("bybit",   "spot"),  "sell": ("gate",    "futures")},
+    "K": {"buy": ("gate",    "spot"),  "sell": ("okx",     "futures")},
+    "L": {"buy": ("okx",     "spot"),  "sell": ("gate",    "futures")},
 }
 
 # Папки
