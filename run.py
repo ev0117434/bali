@@ -41,6 +41,8 @@ SCRIPTS = [
     "binance_futures",
     "bybit_spot",
     "bybit_futures",
+    "okx_spot",
+    "okx_futures",
     "stale_monitor",
     "latency_monitor",
     "spread_scanner",
@@ -55,6 +57,8 @@ COLORS = {
     "binance_futures": "\033[96m",  # голубой
     "bybit_spot":      "\033[92m",  # зелёный
     "bybit_futures":   "\033[93m",  # жёлтый
+    "okx_spot":        "\033[97m",  # белый
+    "okx_futures":     "\033[37m",  # светло-серый
     "stale_monitor":   "\033[95m",  # фиолетовый
     "latency_monitor": "\033[91m",  # красный
     "spread_scanner":  "\033[33m",  # оранжевый

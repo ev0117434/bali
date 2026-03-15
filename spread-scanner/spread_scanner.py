@@ -13,6 +13,10 @@ Cooldown: найденный сигнал по (direction, symbol) не пише
 Directions:
   A: binance_spot(ask) → bybit_futures(bid)
   B: bybit_spot(ask)   → binance_futures(bid)
+  C: okx_spot(ask)     → binance_futures(bid)
+  D: binance_spot(ask) → okx_futures(bid)
+  E: okx_spot(ask)     → bybit_futures(bid)
+  F: bybit_spot(ask)   → okx_futures(bid)
 """
 import asyncio
 import logging
@@ -50,11 +54,19 @@ _BASE = os.path.join(os.path.dirname(__file__), "..", "dictionaries", "combinati
 PAIR_FILES = {
     "A": os.path.join(_BASE, "binance_spot_bybit_futures.txt"),
     "B": os.path.join(_BASE, "bybit_spot_binance_futures.txt"),
+    "C": os.path.join(_BASE, "okx_spot_binance_futures.txt"),
+    "D": os.path.join(_BASE, "binance_spot_okx_futures.txt"),
+    "E": os.path.join(_BASE, "okx_spot_bybit_futures.txt"),
+    "F": os.path.join(_BASE, "bybit_spot_okx_futures.txt"),
 }
 
 _SOURCES = {
     "A": {"buy": ("binance", "spot"),  "sell": ("bybit",   "futures")},
     "B": {"buy": ("bybit",   "spot"),  "sell": ("binance", "futures")},
+    "C": {"buy": ("okx",     "spot"),  "sell": ("binance", "futures")},
+    "D": {"buy": ("binance", "spot"),  "sell": ("okx",     "futures")},
+    "E": {"buy": ("okx",     "spot"),  "sell": ("bybit",   "futures")},
+    "F": {"buy": ("bybit",   "spot"),  "sell": ("okx",     "futures")},
 }
 
 # Папки
