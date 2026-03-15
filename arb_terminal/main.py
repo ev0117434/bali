@@ -10,7 +10,6 @@ Usage:
 """
 
 import argparse
-import signal
 import sys
 import time
 import threading
@@ -519,17 +518,6 @@ def run_trade_cycle(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Ctrl-C handler
-# ─────────────────────────────────────────────────────────────────────────────
-
-_shutdown = threading.Event()
-
-
-def _sigint(signum, frame):
-    _shutdown.set()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -584,9 +572,6 @@ def main() -> None:
 
     # ── Signal loop ───────────────────────────────────────────────────────
     for sig in listener.listen():
-        if _shutdown.is_set():
-            break
-
         # Age check
         if sig.age_sec > cfg.SIGNAL_MAX_AGE_SEC:
             console.print(
@@ -636,5 +621,13 @@ def main() -> None:
     console.print("[dim]Shutdown.[/]")
 
 
+def _run() -> None:
+    try:
+        main()
+    except KeyboardInterrupt:
+        console.print("\n[dim]Interrupted — bye.[/]")
+        sys.exit(0)
+
+
 if __name__ == "__main__":
-    main()
+    _run()

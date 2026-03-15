@@ -188,9 +188,16 @@ class SignalListener:
         self._pubsub.subscribe(self._channel)
 
     def listen(self) -> Generator[Signal, None, None]:
-        """Blocking generator. Yields parsed Signal objects."""
+        """
+        Blocking generator. Yields parsed Signal objects.
+        Uses get_message(timeout=1) so Ctrl+C (KeyboardInterrupt) is
+        always delivered within ~1 second.
+        """
         assert self._pubsub is not None, "Call connect() first"
-        for message in self._pubsub.listen():
+        while True:
+            message = self._pubsub.get_message(
+                ignore_subscribe_messages=True, timeout=1.0
+            )
             if message and message.get("type") == "message":
                 data = message["data"]
                 sig = parse_signal(data)
