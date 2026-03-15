@@ -92,9 +92,10 @@ class TestRedisHashFields:
 
     @pytest.mark.asyncio
     async def test_all_8_fields_present(self, redis):
-        binance_spot._redis_buffer.clear()
-        await write_binance_spot(redis)
-        data = await redis.hgetall("md:binance:spot:BTCUSDT")
+        # Use bybit which always provides last price (non-empty)
+        bybit_spot._redis_buffer.clear()
+        await write_bybit_spot(redis)
+        data = await redis.hgetall("md:bybit:spot:SOLUSDT")
         assert set(data.keys()) == self.REQUIRED_FIELDS
 
     @pytest.mark.asyncio
@@ -142,11 +143,12 @@ class TestRedisHashFields:
         assert data["last"] == "150.15"
 
     @pytest.mark.asyncio
-    async def test_binance_spot_has_empty_last(self, redis):
+    async def test_binance_spot_has_no_last_field(self, redis):
+        # Binance bookTicker never provides last price, so the field is not written to Redis
         binance_spot._redis_buffer.clear()
         await write_binance_spot(redis)
         data = await redis.hgetall("md:binance:spot:BTCUSDT")
-        assert data["last"] == ""
+        assert "last" not in data
 
     @pytest.mark.asyncio
     async def test_binance_spot_ts_exchange_is_zero(self, redis):
@@ -154,6 +156,35 @@ class TestRedisHashFields:
         await write_binance_spot(redis)
         data = await redis.hgetall("md:binance:spot:BTCUSDT")
         assert data["ts_exchange"] == "0"
+
+    @pytest.mark.asyncio
+    async def test_partial_update_does_not_overwrite_with_empty(self, redis):
+        """Partial updates with empty fields must preserve previous Redis values."""
+        bybit_futures._redis_buffer.clear()
+        # First update: full data
+        parsed_full = {
+            "symbol": "BTCUSDT", "bid": "67000.00", "bid_qty": "5.0",
+            "ask": "67001.00", "ask_qty": "3.0", "last": "67000.50",
+            "ts_exchange": "1000",
+        }
+        await bybit_futures.write_redis(redis, parsed_full, now_ms(), _log)
+
+        # Second update: only bid changed, ask/last are empty (partial update)
+        parsed_partial = {
+            "symbol": "BTCUSDT", "bid": "67005.00", "bid_qty": "4.0",
+            "ask": "", "ask_qty": "", "last": "",
+            "ts_exchange": "2000",
+        }
+        await bybit_futures.write_redis(redis, parsed_partial, now_ms(), _log)
+
+        data = await redis.hgetall("md:bybit:futures:BTCUSDT")
+        # bid updated
+        assert data["bid"] == "67005.00"
+        assert data["bid_qty"] == "4.0"
+        # ask and last preserved from first update
+        assert data["ask"] == "67001.00"
+        assert data["ask_qty"] == "3.0"
+        assert data["last"] == "67000.50"
 
 
 # ---------------------------------------------------------------------------
