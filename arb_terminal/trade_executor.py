@@ -22,14 +22,18 @@ def calculate_entry_prices(
     signal: Signal, spread_reduction: float
 ) -> Tuple[float, float, float]:
     """
-    Adjust buy and sell prices so the limit spread is tighter by
-    `spread_reduction` percentage points (split equally between legs).
+    Place limit orders *inside* the spread to capture more of it.
+
+    Buy limit  = ask - half  (below market ask  → passive, waits for price to drop)
+    Sell limit = bid + half  (above market bid  → passive, waits for price to rise)
+
+    This widens the effective spread captured vs crossing the market.
 
     Returns: (adjusted_buy_price, adjusted_sell_price, new_spread_pct)
     """
     half = spread_reduction / 2 / 100  # pp → fraction, then halved
-    adj_buy = signal.buy_ask * (1 + half)
-    adj_sell = signal.sell_bid * (1 - half)
+    adj_buy = signal.buy_ask * (1 - half)
+    adj_sell = signal.sell_bid * (1 + half)
     new_spread = (adj_sell / adj_buy - 1) * 100
     return adj_buy, adj_sell, new_spread
 

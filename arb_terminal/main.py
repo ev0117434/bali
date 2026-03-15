@@ -124,11 +124,11 @@ def build_signal_panel(
     )
     t.add_row(
         "  Buy price",
-        f"{_fmt_price(adj_buy)}  (orig {_fmt_price(sig.buy_ask)}, +0.{int(spread_reduction/2*100):02d}%)",
+        f"{_fmt_price(adj_buy)}  (orig {_fmt_price(sig.buy_ask)}, -0.{int(spread_reduction/2*100):02d}%)",
     )
     t.add_row(
         "  Sell price",
-        f"{_fmt_price(adj_sell)}  (orig {_fmt_price(sig.sell_bid)}, -0.{int(spread_reduction/2*100):02d}%)",
+        f"{_fmt_price(adj_sell)}  (orig {_fmt_price(sig.sell_bid)}, +0.{int(spread_reduction/2*100):02d}%)",
     )
     t.add_row(
         "  Buy qty ~",
