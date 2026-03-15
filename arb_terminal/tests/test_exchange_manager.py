@@ -209,6 +209,34 @@ class TestRefreshOrder:
             status="open", filled=100.0,
         )
         em.refresh_order(info, "THE/USDT")
-        # Should not raise, and state preserved
         assert info.status == "open"
         assert info.filled == 100.0
+
+    def test_bybit_futures_fallback_to_closed_order(self):
+        """Bybit UTA: fetch_open_order raises OrderNotFound → falls back to fetch_closed_order."""
+        import ccxt
+        spot = _make_spot_mock()
+        futures = _make_futures_mock()
+
+        futures.fetch_open_order.side_effect = ccxt.OrderNotFound("not found")
+        futures.fetch_closed_order.return_value = {
+            "status": "closed",
+            "filled": 424.0,
+            "average": 0.23585,
+            "cost": 99.99,
+        }
+
+        em = ExchangeManager({"bybit": {"apiKey": "k", "secret": "s"}})
+        em._spot["bybit"] = spot
+        em._futures["bybit"] = futures
+
+        info = OrderInfo(
+            order_id="789", exchange="bybit", side="sell",
+            symbol="THE/USDT:USDT", planned_price=0.23585, planned_amount=424.0,
+        )
+        em.refresh_order(info, "THE/USDT")
+
+        assert info.status == "closed"
+        assert info.filled == pytest.approx(424.0)
+        futures.fetch_open_order.assert_called_once()
+        futures.fetch_closed_order.assert_called_once()

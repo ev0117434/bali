@@ -243,33 +243,61 @@ class ExchangeManager:
     # Order monitoring
     # ------------------------------------------------------------------
 
-    def _fetch_order_params(self, exchange: str, side: str) -> dict:
-        """Exchange-specific params for fetch_order."""
-        if exchange == "bybit" and side == "sell":
-            return {"category": "linear"}
-        return {}
+    def _fetch_single_order(
+        self, exchange: str, order_id: str, symbol: str, side: str
+    ) -> dict:
+        """
+        Fetch one order by ID, handling exchange quirks:
+
+        Bybit UTA quirk — fetch_order() only searches v5/order/realtime
+        (active orders). Once an order is filled it moves to history and
+        fetch_order raises OrderNotFound.  We try fetch_open_order first;
+        on OrderNotFound we fall back to fetch_closed_order (history).
+
+        All other exchanges: plain fetch_order with optional category param.
+        """
+        import ccxt as _ccxt
+
+        if side == "buy":
+            ex = self.get_spot(exchange)
+            sym = symbol
+            params: dict = {}
+        else:
+            ex = self.get_futures(exchange)
+            sym = f"{symbol}:USDT"
+            params = {"category": "linear"} if exchange == "bybit" else {}
+
+        if exchange == "bybit":
+            # Try active orders first (fast path)
+            try:
+                return ex.fetch_open_order(order_id, sym, params)
+            except _ccxt.OrderNotFound:
+                pass
+            except Exception:
+                pass
+            # Fall back to order history (filled / cancelled orders)
+            try:
+                return ex.fetch_closed_order(order_id, sym, params)
+            except Exception:
+                raise
+        else:
+            return ex.fetch_order(order_id, sym, params)
 
     def refresh_order(self, info: "OrderInfo", ccxt_symbol: str) -> None:
         """Update OrderInfo in-place with latest exchange data."""
         if info.status in ("closed", "canceled", "error") or not info.order_id:
             return
         try:
-            params = self._fetch_order_params(info.exchange, info.side)
-            if info.side == "buy":
-                raw = self.get_spot(info.exchange).fetch_order(
-                    info.order_id, ccxt_symbol, params
-                )
-            else:
-                raw = self.get_futures(info.exchange).fetch_order(
-                    info.order_id, f"{ccxt_symbol}:USDT", params
-                )
-            # raw.get("status") can exist but be None — use `or` to keep prev value
+            raw = self._fetch_single_order(
+                info.exchange, info.order_id, ccxt_symbol, info.side
+            )
+            # raw["status"] can exist but be None — use `or` to keep previous value
             info.status = raw.get("status") or info.status
             info.filled = float(raw.get("filled") or 0)
             info.avg_price = float(raw.get("average") or 0)
             info.cost = float(raw.get("cost") or 0)
         except Exception:
-            pass  # keep last known state
+            pass  # keep last known state on any network / parse error
 
     def cancel_order(
         self, exchange: str, order_id: str, ccxt_symbol: str, side: str
