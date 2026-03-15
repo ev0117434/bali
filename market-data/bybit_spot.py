@@ -200,6 +200,8 @@ async def _read_loop(
 
         parsed = parse_ticker(data)
         if parsed and parsed["symbol"]:
+            if data.get("type") == "snapshot" and (parsed["bid"] == "" or parsed["ask"] == ""):
+                log.warning("snapshot_missing_bid_ask", symbol=parsed["symbol"], raw_keys=list(data.get("data", {}).keys()))
             counter[0] += 1
             await writer.write(parsed, ts_received)
 
