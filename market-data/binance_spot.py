@@ -56,15 +56,13 @@ async def write_redis(redis_client, parsed: dict, ts_received: int, log) -> bool
     symbol = parsed["symbol"]
     key = f"md:{EXCHANGE}:{MARKET}:{symbol}"
     mapping = {
-        "bid": parsed["bid"],
-        "bid_qty": parsed["bid_qty"],
-        "ask": parsed["ask"],
-        "ask_qty": parsed["ask_qty"],
-        "last": parsed["last"],
         "ts_exchange": parsed["ts_exchange"],
         "ts_received": str(ts_received),
         "ts_redis": str(ts_redis),
     }
+    for field in ("bid", "bid_qty", "ask", "ask_qty", "last"):
+        if parsed[field] != "":
+            mapping[field] = parsed[field]
     payload = orjson.dumps({"symbol": symbol, "key": key}).decode()
     try:
         pipe = redis_client.pipeline()
