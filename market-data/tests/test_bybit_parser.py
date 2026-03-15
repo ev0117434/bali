@@ -10,6 +10,9 @@ _log = structlog.get_logger()
 import bybit_spot
 import bybit_futures
 
+# Alias: old tests used parse_message(msg, log); new API is parse_ticker(msg)
+_spot_parse = bybit_spot.parse_ticker
+
 
 SNAPSHOT_MSG = {
     "topic": "tickers.BTCUSDT",
@@ -45,7 +48,7 @@ DELTA_MSG = {
 # ---------------------------------------------------------------------------
 class TestBybitSpotParser:
     def test_snapshot_message(self):
-        result = bybit_spot.parse_message(SNAPSHOT_MSG, _log)
+        result = _spot_parse(SNAPSHOT_MSG)
         assert result is not None
         assert result["symbol"] == "BTCUSDT"
         assert result["bid"] == "67234.50"
@@ -57,50 +60,50 @@ class TestBybitSpotParser:
 
     def test_delta_message_processed_same_as_snapshot(self):
         """Delta updates have the same field structure and must be handled."""
-        result = bybit_spot.parse_message(DELTA_MSG, _log)
+        result = _spot_parse(DELTA_MSG)
         assert result is not None
         assert result["symbol"] == "ETHUSDT"
         assert result["ts_exchange"] == "1710412801000"
 
     def test_symbol_uppercased(self):
         msg = {**SNAPSHOT_MSG, "data": {**SNAPSHOT_MSG["data"], "symbol": "btcusdt"}}
-        result = bybit_spot.parse_message(msg, _log)
+        result = _spot_parse(msg)
         assert result["symbol"] == "BTCUSDT"
 
     def test_subscribe_success_returns_none(self):
         msg = {"success": True, "ret_msg": "", "op": "subscribe", "conn_id": "abc"}
-        result = bybit_spot.parse_message(msg, _log)
+        result = _spot_parse(msg)
         assert result is None
 
     def test_subscribe_failure_returns_none(self):
         msg = {"success": False, "ret_msg": "error", "op": "subscribe"}
-        result = bybit_spot.parse_message(msg, _log)
+        result = _spot_parse(msg)
         assert result is None
 
     def test_ping_returns_none(self):
         """Ping from server — handled separately in read_loop, parser returns None."""
         msg = {"op": "ping"}
-        result = bybit_spot.parse_message(msg, _log)
+        result = _spot_parse(msg)
         assert result is None
 
     def test_pong_response_returns_none(self):
         """Server pong heartbeat — must be silently ignored."""
         msg = {"ret_msg": "pong", "op": "pong"}
-        result = bybit_spot.parse_message(msg, _log)
+        result = _spot_parse(msg)
         assert result is None
 
     def test_unknown_topic_returns_none(self):
         msg = {"topic": "orderbook.BTCUSDT", "data": {}}
-        result = bybit_spot.parse_message(msg, _log)
+        result = _spot_parse(msg)
         assert result is None
 
     def test_empty_dict_returns_none(self):
-        result = bybit_spot.parse_message({}, _log)
+        result = _spot_parse({})
         assert result is None
 
     def test_missing_data_field_returns_none(self):
         msg = {"topic": "tickers.BTCUSDT", "ts": 1234567890000}
-        result = bybit_spot.parse_message(msg, _log)
+        result = _spot_parse(msg)
         assert result is None
 
     def test_missing_bid_price_defaults_to_empty(self):
@@ -111,7 +114,7 @@ class TestBybitSpotParser:
             "ts": 1710412800000,
             "data": {"symbol": "SOLUSDT", "lastPrice": "150.0"},
         }
-        result = bybit_spot.parse_message(msg, _log)
+        result = _spot_parse(msg)
         assert result is not None
         assert result["bid"] == ""
         assert result["ask"] == ""
@@ -119,12 +122,12 @@ class TestBybitSpotParser:
 
     def test_ts_exchange_from_outer_ts(self):
         """ts_exchange comes from the outer 'ts' field, not from data."""
-        result = bybit_spot.parse_message(SNAPSHOT_MSG, _log)
+        result = _spot_parse(SNAPSHOT_MSG)
         assert result["ts_exchange"] == str(SNAPSHOT_MSG["ts"])
 
     def test_missing_outer_ts_defaults_to_zero(self):
         msg = {k: v for k, v in SNAPSHOT_MSG.items() if k != "ts"}
-        result = bybit_spot.parse_message(msg, _log)
+        result = _spot_parse(msg)
         assert result["ts_exchange"] == "0"
 
 
