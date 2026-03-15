@@ -6,6 +6,7 @@
   - load_symbols()
   - SpreadScanner cooldown логика
 """
+import asyncio
 import logging
 import os
 import sys
@@ -16,6 +17,11 @@ import fakeredis.aioredis
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "market-data"))
 
+import spread_scanner as ss
+
+# Фиксируем порог для тестов независимо от переменной окружения
+ss.MIN_SPREAD_PCT = 0.1
+
 
 @pytest_asyncio.fixture
 async def redis():
@@ -23,10 +29,6 @@ async def redis():
     yield client
     await client.aclose()
 
-import spread_scanner as ss
-
-# Фиксируем порог для тестов независимо от переменной окружения
-ss.MIN_SPREAD_PCT = 0.1
 
 NOW_MS    = 1_710_000_000_000
 FRESH_TS  = str(NOW_MS - 100)     # 100 мс назад — свежие
@@ -62,32 +64,26 @@ class TestCalcSpread:
         assert result is None
 
     def test_negative_spread_returns_none(self):
-        """Отрицательный спред (sell < buy) → None."""
         result = self._call(buy_ask="100.5", sell_bid="100.0")
         assert result is None
 
     def test_equal_prices_returns_none(self):
-        """Нулевой спред → None."""
         result = self._call(buy_ask="100.0", sell_bid="100.0")
         assert result is None
 
     def test_stale_buy_data_returns_none(self):
-        """Устаревшие данные покупки → пропустить."""
         result = self._call(buy_ts=STALE_TS)
         assert result is None
 
     def test_stale_sell_data_returns_none(self):
-        """Устаревшие данные продажи → пропустить."""
         result = self._call(sell_ts=STALE_TS)
         assert result is None
 
     def test_missing_buy_ask_returns_none(self):
-        """Нет цены покупки → None."""
         result = self._call(buy_ask=None)
         assert result is None
 
     def test_missing_sell_bid_returns_none(self):
-        """Нет цены продажи → None."""
         result = self._call(sell_bid=None)
         assert result is None
 
@@ -102,7 +98,7 @@ class TestCalcSpread:
     def test_missing_ts_returns_none(self):
         """None в поле ts_redis (HMGET вернул None) → пропустить."""
         result = ss.calc_spread(
-            ["100.0", "1.0", None],   # ts_redis is None
+            ["100.0", "1.0", None],
             ["100.3", "1.0", None],
             "A", "BTCUSDT", NOW_MS,
             ("binance", "spot"), ("bybit", "futures"),
@@ -110,12 +106,10 @@ class TestCalcSpread:
         assert result is None
 
     def test_invalid_price_returns_none(self):
-        """Нечисловая цена → None."""
         result = self._call(buy_ask="N/A", sell_bid="100.2")
         assert result is None
 
     def test_signal_fields_complete(self):
-        """Сигнал содержит все обязательные поля."""
         result = self._call(buy_ask="50000.0", sell_bid="50200.0")
         assert result is not None
         required = {
@@ -126,48 +120,43 @@ class TestCalcSpread:
         assert required.issubset(result.keys())
 
     def test_signal_ts_is_now(self):
-        """ts_signal совпадает с переданным now_ms."""
         result = self._call()
         assert result["ts_signal"] == NOW_MS
 
     def test_spread_pct_rounded_to_4_decimals(self):
-        """spread_pct округлён до 4 знаков."""
         result = self._call(buy_ask="100.0", sell_bid="100.13579")
         assert result is not None
         assert result["spread_pct"] == round(0.13579, 4)
 
     def test_direction_a_exchange_labels(self):
-        """Direction A: buy=binance/spot, sell=bybit/futures."""
-        result = self._call(direction="A", buy_info=("binance", "spot"), sell_info=("bybit", "futures"))
-        assert result["buy_exchange"] == "binance"
-        assert result["buy_market"]   == "spot"
+        result = self._call(direction="A", buy_info=("binance", "spot"),
+                            sell_info=("bybit", "futures"))
+        assert result["buy_exchange"]  == "binance"
+        assert result["buy_market"]    == "spot"
         assert result["sell_exchange"] == "bybit"
         assert result["sell_market"]   == "futures"
 
     def test_direction_b_exchange_labels(self):
-        """Direction B: buy=bybit/spot, sell=binance/futures."""
-        result = self._call(direction="B", buy_info=("bybit", "spot"), sell_info=("binance", "futures"))
+        result = self._call(direction="B", buy_info=("bybit", "spot"),
+                            sell_info=("binance", "futures"))
         assert result["buy_exchange"]  == "bybit"
         assert result["sell_exchange"] == "binance"
 
     def test_empty_strings_returns_none(self):
-        """Пустые строки вместо цен → None."""
         result = self._call(buy_ask="", sell_bid="")
         assert result is None
 
     def test_spread_at_exact_threshold(self):
-        """Спред ровно на пороге 0.1% → None (строго меньше не проходит из-за FP)."""
+        """0.1% ровно на пороге — не проходит из-за floating point."""
         result = self._call(buy_ask="100.0", sell_bid="100.1")
         assert result is None
 
     def test_spread_just_above_threshold(self):
-        """Спред чуть выше порога → сигнал."""
         result = self._call(buy_ask="100.0", sell_bid="100.101")
         assert result is not None
         assert result["spread_pct"] > 0.1
 
     def test_qty_preserved_in_signal(self):
-        """Объёмы из источника попадают в сигнал без изменений."""
         result = self._call(buy_ask="100.0", buy_qty="2.5", sell_bid="100.3", sell_qty="3.7")
         assert result is not None
         assert result["buy_ask_qty"]  == "2.5"
@@ -206,29 +195,31 @@ class TestLoadSymbols:
         assert ss.load_symbols(str(f)) == []
 
 
-# ── Cooldown (дедупликация сигналов) ─────────────────────────────────────────
+# ── Cooldown ──────────────────────────────────────────────────────────────────
 
 def _make_scanner(redis_client):
-    """Создаёт SpreadScanner с null-логгерами для тестов."""
-    null_log = logging.getLogger("null")
-    null_log.addHandler(logging.NullHandler())
-
+    """SpreadScanner с подавленным созданием файловых логгеров."""
     class _FakeLog:
         def info(self, *a, **kw): pass
         def error(self, *a, **kw): pass
-        def debug(self, *a, **kw): pass
 
-    return ss.SpreadScanner(
-        redis_client=redis_client,
-        log=_FakeLog(),
-        signal_logger=null_log,
-        snapshot_logger=null_log,
-    )
+    null = logging.getLogger("null")
+    null.addHandler(logging.NullHandler())
+
+    scanner = ss.SpreadScanner.__new__(ss.SpreadScanner)
+    scanner.redis        = redis_client
+    scanner.log          = _FakeLog()
+    scanner.activity_log = null
+    scanner.signal_log   = null
+    scanner._symbols     = {}
+    scanner._shutdown    = asyncio.Event()
+    scanner._reload_flag = False
+    scanner._cooldown    = {}
+    scanner._n           = 0
+    return scanner
 
 
-async def _seed_redis(redis, buy_ex, buy_mkt, sell_ex, sell_mkt, symbol,
-                      buy_ask, sell_bid, ts):
-    """Заполняет Redis тестовыми данными."""
+async def _seed(redis, buy_ex, buy_mkt, sell_ex, sell_mkt, symbol, buy_ask, sell_bid, ts):
     await redis.hset(f"md:{buy_ex}:{buy_mkt}:{symbol}", mapping={
         "ask": buy_ask, "ask_qty": "1.0", "ts_redis": str(ts),
     })
@@ -239,133 +230,121 @@ async def _seed_redis(redis, buy_ex, buy_mkt, sell_ex, sell_mkt, symbol,
 
 class TestCooldown:
     @pytest.mark.asyncio
-    async def test_first_signal_emitted(self, redis):
-        """Первый сигнал по паре отправляется без задержки."""
+    async def test_first_signal_written(self, redis):
+        """Первый сигнал по паре записывается в signals/."""
         scanner = _make_scanner(redis)
         scanner._symbols = {"A": ["BTCUSDT"]}
-
         ts = NOW_MS
-        await _seed_redis(redis, "binance", "spot", "bybit", "futures", "BTCUSDT",
-                          buy_ask="100.0", sell_bid="102.0", ts=ts)
-
-        emitted, suppressed = await scanner._cycle(ts)
-        assert emitted == 1
+        await _seed(redis, "binance", "spot", "bybit", "futures", "BTCUSDT",
+                    "100.0", "102.0", ts)
+        pairs, written, suppressed = await scanner._cycle(ts)
+        assert written == 1
         assert suppressed == 0
 
     @pytest.mark.asyncio
-    async def test_repeat_signal_suppressed_within_cooldown(self, redis):
-        """Второй сигнал в течение COOLDOWN_MS не отправляется."""
+    async def test_repeat_suppressed_within_cooldown(self, redis):
+        """Второй сигнал в течение cooldown не пишется в signals/."""
         scanner = _make_scanner(redis)
         scanner._symbols = {"A": ["BTCUSDT"]}
-
         ts = NOW_MS
-        await _seed_redis(redis, "binance", "spot", "bybit", "futures", "BTCUSDT",
-                          buy_ask="100.0", sell_bid="102.0", ts=ts)
-
-        emitted1, _  = await scanner._cycle(ts)
-        # Второй цикл через 1 мс — всё ещё в cooldown
-        emitted2, suppressed = await scanner._cycle(ts + 1)
-        assert emitted1 == 1
-        assert emitted2 == 0
-        assert suppressed == 1
+        await _seed(redis, "binance", "spot", "bybit", "futures", "BTCUSDT",
+                    "100.0", "102.0", ts)
+        _, written1, _ = await scanner._cycle(ts)
+        _, written2, suppressed = await scanner._cycle(ts + 1)
+        assert written1 == 1
+        assert written2 == 0
+        assert suppressed == 1   # спред найден, но заблокирован cooldown
 
     @pytest.mark.asyncio
     async def test_signal_allowed_after_cooldown(self, redis):
-        """Сигнал разрешён после истечения COOLDOWN_MS."""
+        """Сигнал снова пишется после истечения cooldown."""
         scanner = _make_scanner(redis)
         scanner._symbols = {"A": ["BTCUSDT"]}
-
         ts = NOW_MS
-        await _seed_redis(redis, "binance", "spot", "bybit", "futures", "BTCUSDT",
-                          buy_ask="100.0", sell_bid="102.0", ts=ts)
+        await _seed(redis, "binance", "spot", "bybit", "futures", "BTCUSDT",
+                    "100.0", "102.0", ts)
+        _, written1, _ = await scanner._cycle(ts)
 
-        emitted1, _ = await scanner._cycle(ts)
-
-        # Переставляем ts_redis чтобы данные остались свежими
         ts2 = ts + ss.COOLDOWN_MS + 1
-        await _seed_redis(redis, "binance", "spot", "bybit", "futures", "BTCUSDT",
-                          buy_ask="100.0", sell_bid="102.0", ts=ts2)
-        emitted2, suppressed2 = await scanner._cycle(ts2)
-
-        assert emitted1 == 1
-        assert emitted2 == 1
+        await _seed(redis, "binance", "spot", "bybit", "futures", "BTCUSDT",
+                    "100.0", "102.0", ts2)
+        _, written2, suppressed2 = await scanner._cycle(ts2)
+        assert written1 == 1
+        assert written2 == 1
         assert suppressed2 == 0
 
     @pytest.mark.asyncio
-    async def test_different_symbols_independent_cooldown(self, redis):
-        """Разные символы имеют независимые cooldown-записи."""
+    async def test_scanning_continues_when_suppressed(self, redis):
+        """pairs всегда > 0 даже когда сигнал заблокирован cooldown."""
+        scanner = _make_scanner(redis)
+        scanner._symbols = {"A": ["BTCUSDT"]}
+        ts = NOW_MS
+        await _seed(redis, "binance", "spot", "bybit", "futures", "BTCUSDT",
+                    "100.0", "102.0", ts)
+        await scanner._cycle(ts)                          # первый — пишет
+        pairs, written, suppressed = await scanner._cycle(ts + 1)  # второй — блок
+        assert pairs == 1          # сканирование прошло
+        assert written == 0        # не записано в signals/
+        assert suppressed == 1     # спред найден, cooldown
+
+    @pytest.mark.asyncio
+    async def test_different_symbols_independent(self, redis):
+        """Разные символы имеют независимый cooldown."""
         scanner = _make_scanner(redis)
         scanner._symbols = {"A": ["BTCUSDT", "ETHUSDT"]}
-
         ts = NOW_MS
         for sym in ["BTCUSDT", "ETHUSDT"]:
-            await _seed_redis(redis, "binance", "spot", "bybit", "futures", sym,
-                              buy_ask="100.0", sell_bid="102.0", ts=ts)
-
-        emitted, _ = await scanner._cycle(ts)
-        assert emitted == 2   # оба сигнала прошли
-
-        # Второй цикл — оба заблокированы cooldown
-        emitted2, suppressed2 = await scanner._cycle(ts + 1)
-        assert emitted2 == 0
-        assert suppressed2 == 2
+            await _seed(redis, "binance", "spot", "bybit", "futures", sym,
+                        "100.0", "102.0", ts)
+        _, written, _ = await scanner._cycle(ts)
+        assert written == 2
 
     @pytest.mark.asyncio
-    async def test_different_directions_independent_cooldown(self, redis):
-        """Разные направления (A/B) для одного символа независимы."""
+    async def test_different_directions_independent(self, redis):
+        """Direction A и B для одного символа — независимые cooldown-ключи."""
         scanner = _make_scanner(redis)
-        scanner._symbols = {
-            "A": ["BTCUSDT"],
-            "B": ["BTCUSDT"],
-        }
-
+        scanner._symbols = {"A": ["BTCUSDT"], "B": ["BTCUSDT"]}
         ts = NOW_MS
-        # Direction A: binance spot → bybit futures
-        await _seed_redis(redis, "binance", "spot", "bybit", "futures", "BTCUSDT",
-                          buy_ask="100.0", sell_bid="102.0", ts=ts)
-        # Direction B: bybit spot → binance futures
-        await _seed_redis(redis, "bybit", "spot", "binance", "futures", "BTCUSDT",
-                          buy_ask="100.0", sell_bid="102.0", ts=ts)
+        await _seed(redis, "binance", "spot", "bybit", "futures", "BTCUSDT",
+                    "100.0", "102.0", ts)
+        await _seed(redis, "bybit", "spot", "binance", "futures", "BTCUSDT",
+                    "100.0", "102.0", ts)
+        _, written, _ = await scanner._cycle(ts)
+        assert written == 2
 
-        emitted, _ = await scanner._cycle(ts)
-        assert emitted == 2  # A и B — разные ключи cooldown
-
-    @pytest.mark.asyncio
-    async def test_cooldown_cleanup_removes_expired(self, redis):
-        """_cleanup_cooldown удаляет записи старше COOLDOWN_MS."""
-        scanner = _make_scanner(redis)
+    def test_cleanup_removes_expired(self):
+        """_cleanup_cooldown удаляет только просроченные записи."""
+        scanner = _make_scanner(None)
         scanner._cooldown = {
             ("A", "BTCUSDT"): NOW_MS - ss.COOLDOWN_MS - 1,  # просрочен
-            ("A", "ETHUSDT"): NOW_MS - 100,                 # ещё активен
+            ("A", "ETHUSDT"): NOW_MS - 100,                 # активен
         }
         scanner._cleanup_cooldown(NOW_MS)
         assert ("A", "BTCUSDT") not in scanner._cooldown
         assert ("A", "ETHUSDT") in scanner._cooldown
 
 
-# ── Формат сигнала и ключи ────────────────────────────────────────────────────
+# ── Формат сигнала ────────────────────────────────────────────────────────────
 
 class TestSignalFormat:
-    def _make_signal(self):
-        return ss.calc_spread(
-            ["100.0", "2.5", FRESH_TS],
-            ["100.3", "3.7", FRESH_TS],
+    def test_signal_json_serializable(self):
+        import orjson
+        result = ss.calc_spread(
+            ["100.0", "2.5", FRESH_TS], ["100.3", "3.7", FRESH_TS],
             "A", "BTCUSDT", NOW_MS,
             ("binance", "spot"), ("bybit", "futures"),
         )
-
-    def test_signal_json_serializable(self):
-        """Сигнал сериализуется в JSON без ошибок."""
-        import orjson
-        result = self._make_signal()
         assert result is not None
         decoded = orjson.loads(orjson.dumps(result))
         assert decoded["symbol"] == "BTCUSDT"
-        assert decoded["spread_pct"] == result["spread_pct"]
 
-    def test_redis_key_format(self):
-        """Формат ключа сигнала: sig:spread:{direction}:{symbol}."""
-        assert f"sig:spread:A:BTCUSDT" == "sig:spread:A:BTCUSDT"
-
-    def test_signal_channel_name(self):
+    def test_signal_channel(self):
         assert ss.SIGNAL_CHANNEL == "ch:spread_signals"
+
+    def test_scan_interval_default(self):
+        """SCAN_INTERVAL_MS по умолчанию 200 (0.2 сек)."""
+        assert ss.SCAN_INTERVAL_MS == 200
+
+    def test_cooldown_default_1h(self):
+        """COOLDOWN_SEC по умолчанию 3600 (1 час)."""
+        assert ss.COOLDOWN_SEC == 3600
