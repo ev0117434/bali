@@ -34,6 +34,8 @@ async def scan_once(redis_client) -> tuple[list[dict], int]:
         total += len(keys)
 
         for key in keys:
+            if key.count(':') != 3:  # skip md:hist:* and other non-collector keys
+                continue
             ts_redis = await redis_client.hget(key, "ts_redis")
             if ts_redis is None:
                 # Key exists but has no ts_redis — corrupted entry

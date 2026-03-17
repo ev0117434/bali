@@ -333,15 +333,7 @@ async def main() -> None:
                 continue
             exchange, market = source
 
-            # Fire-and-forget — does not block the listener loop
-            asyncio.create_task(
-                _handle_message(redis_client, exchange, market, msg["data"], log)
-            )
-
-    # Graceful shutdown: wait for in-flight write tasks
-    pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    if pending:
-        await asyncio.wait(pending, timeout=5)
+            await _handle_message(redis_client, exchange, market, msg["data"], log)
 
     await redis_client.aclose()
     log.info("price_history_writer_stopped")

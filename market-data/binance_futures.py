@@ -127,7 +127,10 @@ async def ws_worker(symbols: list[str], conn_id: int, redis_client, shutdown_eve
                     if parsed:
                         await write_redis(redis_client, parsed, ts_received, log)
 
-                await ws.close(1000)
+                try:
+                    await ws.close(1000)
+                except Exception:
+                    pass
 
         except asyncio.CancelledError:
             break

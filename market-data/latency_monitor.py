@@ -84,6 +84,8 @@ async def run(redis_client, shutdown_event: asyncio.Event, log):
         )
 
         for key in keys:
+            if key.count(':') != 3:  # skip md:hist:* and other non-collector keys
+                continue
             vals = await redis_client.hmget(key, "ts_exchange", "ts_received", "ts_redis")
             ts_exchange, ts_received, ts_redis_val = vals
             if not all([ts_exchange, ts_received, ts_redis_val]):

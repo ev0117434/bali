@@ -83,6 +83,7 @@ def get_redis() -> aioredis.Redis:
         REDIS_URL,
         decode_responses=True,
         retry_on_error=[aioredis.ConnectionError, aioredis.TimeoutError],
+        max_connections=20,
     )
 
 
