@@ -16,10 +16,27 @@ Redis key schema:
   Type:    Redis List
   Element: "{ts_ms}:{bid}:{ask}"   (colon-separated string, compact)
 
+Slot registry:
+  md:hist:registry
+  Type:  Redis Hash
+  Field: "{slot}"  (string "0".."MAX_CHUNKS-1")
+  Value: "{chunk_num}:{start_ts_ms}"
+
+  Updated once per slot rotation (every CHUNK_SECONDS). Consumers read this
+  hash to know which time window each slot covers and whether slot data is
+  from the expected cycle or stale from a previous one.
+
 Example:
   md:hist:binance:spot:BTCUSDT:2
   -> ["1710754899000:42500.50:42501.00",
       "1710754900123:42500.60:42501.10", ...]
+
+  md:hist:registry
+  -> {"0": "1451:1741234800000",
+      "1": "1452:1741236000000",
+      "2": "1453:1741237200000",
+      "3": "1449:1741230000000",
+      "4": "1450:1741231200000"}
 """
 import asyncio
 import os
@@ -41,6 +58,7 @@ BATCH_SIZE: int    = int(os.getenv("HIST_BATCH_SIZE", "200"))
 BATCH_TIMEOUT: float = float(os.getenv("HIST_BATCH_TIMEOUT_MS", "100")) / 1000  # -> seconds
 
 CHANNEL_PATTERN = "md:updates:*"
+REGISTRY_KEY    = "md:hist:registry"
 
 
 # ---------------------------------------------------------------------------
@@ -57,16 +75,28 @@ class RotationTracker:
     Tracks the last known chunk_num per (exchange, market, symbol).
     Returns True when chunk_num advances, signalling that we must DEL
     the slot key before starting to write the new chunk.
+
+    Also tracks which (slot, chunk_num) pairs have already been written
+    to the registry hash so we only HSET once per rotation event.
     """
 
     def __init__(self) -> None:
         self._state: dict[tuple[str, str, str], int] = {}
+        self._registered: set[tuple[int, int]] = set()  # (slot, chunk_num)
 
     def needs_rotation(self, exchange: str, market: str, symbol: str,
                        chunk_num: int) -> bool:
         key = (exchange, market, symbol)
         if self._state.get(key) != chunk_num:
             self._state[key] = chunk_num
+            return True
+        return False
+
+    def needs_registry_update(self, slot: int, chunk_num: int) -> bool:
+        """Return True the first time this (slot, chunk_num) pair is seen."""
+        key = (slot, chunk_num)
+        if key not in self._registered:
+            self._registered.add(key)
             return True
         return False
 
@@ -116,6 +146,13 @@ async def process_batch(
                       symbol=symbol,
                       new_chunk=chunk_num,
                       slot=slot)
+
+            # Update registry once per (slot, chunk_num) — not per symbol
+            if tracker.needs_registry_update(slot, chunk_num):
+                start_ts_ms = chunk_num * CHUNK_SECONDS * 1000
+                write_pipe.hset(REGISTRY_KEY, str(slot), f"{chunk_num}:{start_ts_ms}")
+                log.info("registry_updated",
+                         slot=slot, chunk_num=chunk_num, start_ts_ms=start_ts_ms)
 
         write_pipe.rpush(hist_key, f"{ts}:{bid}:{ask}")
         wrote += 1
