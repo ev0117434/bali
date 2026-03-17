@@ -280,7 +280,6 @@ redis-cli HGET md:binance:futures:BTCUSDT ts_redis
 
 ```bash
 # Через 30-60 с после запуска — история начинает заполняться
-# Определить текущий слот
 SLOT=$(($(date +%s) / 1200 % 5))
 echo "Текущий слот: $SLOT"
 
@@ -290,11 +289,14 @@ redis-cli LRANGE "md:hist:binance:spot:BTCUSDT:$SLOT" 0 4
 # Количество записей в чанке (растёт непрерывно в течение 20 мин)
 redis-cli LLEN "md:hist:binance:spot:BTCUSDT:$SLOT"
 
-# Убедиться что ключи истории существуют (должно быть много ключей md:hist:*)
+# Убедиться что ключи истории существуют
 redis-cli KEYS "md:hist:*" | wc -l
 
-# Пример одной записи: "{ts_ms}:{bid}:{ask}"
+# Последняя запись: "{ts_ms}:{bid}:{ask}"
 redis-cli LINDEX "md:hist:binance:spot:BTCUSDT:$SLOT" -1
+
+# Реестр слотов: временно́й диапазон каждого слота
+redis-cli HGETALL md:hist:registry
 
 # Проверить лог price_history
 tail -20 logs/price_history.log
@@ -307,18 +309,30 @@ tail -20 logs/price_history.log
 3) "1741234568110:42500.05:42501.10"
 ```
 
+**Ожидаемый вывод `HGETALL md:hist:registry`:**
+```
+1) "2"
+2) "1453:1741237200000"
+3) "3"
+4) "1449:1741230000000"
+...
+```
+Формат значения: `"{chunk_num}:{start_ts_ms}"`. Текущий слот — тот, чей `chunk_num` совпадает с `$(date +%s) / 1200`.
+
 **Ожидаемые строки лога при старте:**
 ```json
 {"event":"price_history_started","chunk_seconds":1200,"max_chunks":5,"batch_size":200,"batch_timeout_ms":100}
 {"event":"subscribed","pattern":"md:updates:*","chunk_seconds":1200,"max_chunks":5}
 ```
 
-**Ожидаемые строки при смене чанка (каждые 20 мин, уровень DEBUG):**
+**Ожидаемые строки при смене чанка (каждые 20 мин):**
 ```json
 {"event":"chunk_rotated","source":"binance:spot","symbol":"BTCUSDT","new_chunk":1234,"slot":4}
+{"event":"registry_updated","slot":4,"chunk_num":1234,"start_ts_ms":1741237200000}
 ```
+`registry_updated` выводится один раз на ротацию слота (не для каждого символа). `chunk_rotated` — для каждого символа (уровень DEBUG).
 
-Чтобы увидеть DEBUG-события ротации:
+Чтобы увидеть `chunk_rotated`:
 ```bash
 LOG_LEVEL=DEBUG python3 run.py --only price_history --no-cleanup
 ```
@@ -331,6 +345,7 @@ LOG_LEVEL=DEBUG python3 run.py --only price_history --no-cleanup
 - `latency_monitor` публикует `latency_report` каждые ~10 с
 - `redis-cli KEYS "md:hist:*" | wc -l` возвращает > 0 в течение минуты после старта
 - `redis-cli LLEN md:hist:binance:spot:BTCUSDT:$SLOT` непрерывно растёт
+- `redis-cli HGETALL md:hist:registry` возвращает до 5 записей (заполняется постепенно — по одной на каждый новый чанк)
 
 ---
 
@@ -980,6 +995,9 @@ done
 SLOT=$(($(date +%s) / 1200 % 5))
 redis-cli LLEN "md:hist:binance:spot:BTCUSDT:$SLOT"
 redis-cli LRANGE "md:hist:binance:spot:BTCUSDT:$SLOT" -5 -1
+
+# Реестр слотов (временно́й диапазон каждого слота)
+redis-cli HGETALL md:hist:registry
 
 # Всего ключей истории
 redis-cli KEYS "md:hist:*" | wc -l

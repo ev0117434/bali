@@ -734,6 +734,7 @@ slot      = chunk_num % MAX_CHUNKS       # номер слота из 5 (0..4)
 
 ### Redis-схема
 
+**Ключи истории (List):**
 ```
 Ключ:    md:hist:{exchange}:{market}:{symbol}:{slot}
 Тип:     List
@@ -759,6 +760,28 @@ LRANGE md:hist:binance:spot:BTCUSDT:2 0 3
 
 На каждый источник (exchange + market) и каждый символ создаётся **5 ключей** (слоты 0–4). В любой момент активен один слот — остальные содержат предыдущие чанки.
 
+**Реестр слотов (Hash):**
+```
+Ключ:   md:hist:registry
+Тип:    Hash
+Поле:   "{slot}"            (строка "0".."4")
+Значение: "{chunk_num}:{start_ts_ms}"
+```
+
+Обновляется один раз на каждую ротацию слота (раз в 20 минут). Позволяет потребителям узнать временно́й диапазон каждого слота и проверить, не устарели ли данные.
+
+**Пример содержимого:**
+```
+HGETALL md:hist:registry
+→ "0" "1451:1741234800000"   ← слот 0 = чанк 1451, начался 1741234800000 мс
+   "1" "1452:1741236000000"   ← слот 1 = чанк 1452, ...
+   "2" "1453:1741237200000"
+   "3" "1449:1741230000000"
+   "4" "1450:1741231200000"
+```
+
+Временно́й диапазон чанка: `[start_ts_ms, start_ts_ms + CHUNK_SECONDS * 1000)`
+
 ### Архитектура
 
 ```
@@ -773,11 +796,14 @@ Redis pub/sub (psubscribe md:updates:*)
        ▼         (один round-trip для всего батча)
   RotationTracker: для каждого (exchange, market, symbol)
     ├── chunk_num изменился? → DEL hist_key (стираем старый слот)
+    │   └── первый раз для (slot, chunk_num)?
+    │       → HSET md:hist:registry {slot} "{chunk_num}:{start_ts_ms}"
     └── RPUSH hist_key "{ts}:{bid}:{ask}"
        │
        │  pipeline (один round-trip)
        ▼
      Redis  md:hist:*:*:*:{slot}
+            md:hist:registry
 ```
 
 ### Параметры
@@ -792,18 +818,23 @@ Redis pub/sub (psubscribe md:updates:*)
 ### Чтение истории
 
 ```bash
-# Все записи в активном слоте для Binance Spot BTCUSDT
-# Текущий слот = (unix_time // 1200) % 5
-redis-cli LRANGE md:hist:binance:spot:BTCUSDT:2 0 -1
+# Текущий слот (математически)
+SLOT=$(($(date +%s) / 1200 % 5))
 
-# Количество точек в чанке
-redis-cli LLEN md:hist:binance:spot:BTCUSDT:2
+# Все записи активного чанка
+redis-cli LRANGE "md:hist:binance:spot:BTCUSDT:$SLOT" 0 -1
+
+# Количество точек
+redis-cli LLEN "md:hist:binance:spot:BTCUSDT:$SLOT"
+
+# Реестр: временно́й диапазон всех слотов
+redis-cli HGETALL md:hist:registry
 ```
 
 ```python
 import time, redis
 
-r = redis.Redis(decode_responses=True)
+r    = redis.Redis(decode_responses=True)
 slot = (int(time.time()) // 1200) % 5
 key  = f"md:hist:binance:spot:BTCUSDT:{slot}"
 
@@ -811,6 +842,34 @@ for entry in r.lrange(key, 0, -1):
     ts, bid, ask = entry.split(":")
     print(ts, bid, ask)
 ```
+
+### Верификация через реестр
+
+Перед чтением данных потребитель может проверить, что слот содержит именно тот чанк, который ожидается:
+
+```python
+import time
+
+CHUNK_SECONDS = 1200
+MAX_CHUNKS    = 5
+
+now_sec        = int(time.time())
+expected_chunk = now_sec // CHUNK_SECONDS
+expected_slot  = expected_chunk % MAX_CHUNKS
+
+registry_val   = r.hget("md:hist:registry", str(expected_slot))
+# registry_val = "1453:1741237200000"
+
+if registry_val:
+    actual_chunk, start_ts_ms = registry_val.split(":")
+    if int(actual_chunk) == expected_chunk:
+        pass  # данные актуальные — можно читать
+    else:
+        pass  # price_history не писал в этот слот — данные от старого цикла
+```
+
+**Нюанс — реестр не заполнен при первом старте:**
+При первом запуске `price_history` реестр пуст (`HGET` вернёт `None`). Он заполняется постепенно: один `HSET` на каждый первый батч символов для данного слота. Обычно все 5 слотов заполнены в течение первого цикла из 5 чанков (100 минут после старта).
 
 ### Нюансы
 
@@ -833,6 +892,7 @@ for entry in r.lrange(key, 0, -1):
 | `price_history_started` | INFO | Старт с параметрами chunk_seconds, max_chunks |
 | `subscribed` | INFO | psubscribe успешен |
 | `chunk_rotated` | DEBUG | Новый чанк для source:symbol, старый слот удалён |
+| `registry_updated` | INFO | Реестр обновлён: slot, chunk_num, start_ts_ms |
 | `batch_error` | ERROR | Ошибка при обработке батча (Redis недоступен и т.д.) |
 | `price_history_stopped` | INFO | Завершение сервиса |
 
@@ -1022,6 +1082,29 @@ md:hist:{exchange}:{market}:{symbol}:{slot}
 **Чтение текущего чанка:**
 ```bash
 redis-cli LRANGE md:hist:binance:spot:BTCUSDT:$(($(date +%s) / 1200 % 5)) 0 -1
+```
+
+### Реестр слотов (Hash)
+
+```
+md:hist:registry
+```
+
+Записывается `price_history.py`. Тип — Redis Hash. Обновляется **один раз при каждой ротации слота** (раз в 20 минут), не при каждом батче.
+
+| Поле | Значение | Описание |
+|---|---|---|
+| `"0"` .. `"4"` | `"{chunk_num}:{start_ts_ms}"` | Индекс чанка и время начала (мс) |
+
+Потребители читают этот хеш чтобы:
+1. Узнать точный временно́й диапазон каждого слота
+2. Убедиться, что данные в слоте от ожидаемого цикла (не устаревшие)
+
+```bash
+redis-cli HGETALL md:hist:registry
+# "0" → "1451:1741234800000"
+# "1" → "1452:1741236000000"
+# ...
 ```
 
 ### Ключи сигналов
@@ -1231,5 +1314,6 @@ Random jitter [0,1) предотвращает синхронное перепо
 | `price_history_started` | INFO | price_history запущен (chunk_seconds, max_chunks) |
 | `subscribed` | INFO | psubscribe на `md:updates:*` успешен |
 | `chunk_rotated` | DEBUG | Начат новый чанк для source:symbol, старый слот удалён |
+| `registry_updated` | INFO | Реестр обновлён: slot, chunk_num, start_ts_ms |
 | `batch_error` | ERROR | Ошибка при обработке батча в price_history |
 | `price_history_stopped` | INFO | price_history завершён |
