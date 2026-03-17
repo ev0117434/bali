@@ -103,6 +103,8 @@ RECONNECT_MAX_DELAY=60
 | `MIN_SPREAD_PCT` | Понизить для тестирования (0.1), повысить для уменьшения сигналов (2.0) |
 | `SYMBOLS_PER_CONN` | Уменьшить при лимитах биржи, увеличить для снижения числа соединений |
 | `LOG_LEVEL` | `DEBUG` для детальной диагностики |
+| `HIST_CHUNK_SECONDS` | Укоротить окно (например, 600 = 10 мин) для теста ротации чанков |
+| `HIST_MAX_CHUNKS` | Увеличить для более глубокой истории (5 × чанк) |
 
 ---
 
@@ -167,7 +169,7 @@ python3 run.py
 1. **Обратный отсчёт 3 секунды** с предупреждением об очистке данных
 2. Удаление папок `logs/` и `signals/`
 3. Очистка Redis (`FLUSHDB`)
-4. Запуск 12 процессов
+4. Запуск 13 процессов
 
 > **Осторожно:** `FLUSHDB` очищает базу Redis целиком. Если Redis используется для других задач — используйте `--no-cleanup`.
 
@@ -225,9 +227,11 @@ python3 binance_spot.py
 [run.py] Удалена папка сигналов: /path/to/signals
 [run.py] Redis очищен (FLUSHDB): redis://localhost:6379/0
 ------------------------------------------------------------
-Запуск 12 скриптов: binance_spot, binance_futures, ...
+Запуск 13 скриптов: binance_spot, binance_futures, ..., price_history, ...
   Запущен binance_spot (PID 1234) → logs/binance_spot.log
   Запущен binance_futures (PID 1235) → logs/binance_futures.log
+  ...
+  Запущен price_history (PID 1245) → logs/price_history.log
   ...
 ```
 
@@ -272,12 +276,61 @@ redis-cli TTL md:binance:spot:BTCUSDT
 redis-cli HGET md:binance:futures:BTCUSDT ts_redis
 ```
 
+### Проверка price_history
+
+```bash
+# Через 30-60 с после запуска — история начинает заполняться
+# Определить текущий слот
+SLOT=$(($(date +%s) / 1200 % 5))
+echo "Текущий слот: $SLOT"
+
+# Посмотреть первые несколько записей по BTCUSDT Binance Spot
+redis-cli LRANGE "md:hist:binance:spot:BTCUSDT:$SLOT" 0 4
+
+# Количество записей в чанке (растёт непрерывно в течение 20 мин)
+redis-cli LLEN "md:hist:binance:spot:BTCUSDT:$SLOT"
+
+# Убедиться что ключи истории существуют (должно быть много ключей md:hist:*)
+redis-cli KEYS "md:hist:*" | wc -l
+
+# Пример одной записи: "{ts_ms}:{bid}:{ask}"
+redis-cli LINDEX "md:hist:binance:spot:BTCUSDT:$SLOT" -1
+
+# Проверить лог price_history
+tail -20 logs/price_history.log
+```
+
+**Ожидаемый вывод `LRANGE`:**
+```
+1) "1741234567890:42500.10:42501.20"
+2) "1741234568001:42500.15:42501.25"
+3) "1741234568110:42500.05:42501.10"
+```
+
+**Ожидаемые строки лога при старте:**
+```json
+{"event":"price_history_started","chunk_seconds":1200,"max_chunks":5,"batch_size":200,"batch_timeout_ms":100}
+{"event":"subscribed","pattern":"md:updates:*","chunk_seconds":1200,"max_chunks":5}
+```
+
+**Ожидаемые строки при смене чанка (каждые 20 мин, уровень DEBUG):**
+```json
+{"event":"chunk_rotated","source":"binance:spot","symbol":"BTCUSDT","new_chunk":1234,"slot":4}
+```
+
+Чтобы увидеть DEBUG-события ротации:
+```bash
+LOG_LEVEL=DEBUG python3 run.py --only price_history --no-cleanup
+```
+
 ### Что означает нормальная работа
 
-- Все 12 процессов запущены и пишут в лог
+- Все 13 процессов запущены и пишут в лог
 - `redis-cli DBSIZE` растёт до нескольких тысяч ключей
 - `stale_monitor` не сообщает о stale ключах (после grace period ~60 с)
 - `latency_monitor` публикует `latency_report` каждые ~10 с
+- `redis-cli KEYS "md:hist:*" | wc -l` возвращает > 0 в течение минуты после старта
+- `redis-cli LLEN md:hist:binance:spot:BTCUSDT:$SLOT` непрерывно растёт
 
 ---
 
@@ -299,6 +352,7 @@ redis-cli HGET md:binance:futures:BTCUSDT ts_redis
 | Красный | latency_monitor |
 | Оранжевый | spread_scanner |
 | Пурпурный | signal_snapshot |
+| Серый | price_history |
 
 ### Ключевые события лога
 
@@ -332,6 +386,17 @@ redis-cli HGET md:binance:futures:BTCUSDT ts_redis
 **Предупреждение об устаревших данных:**
 ```json
 {"event":"stale_detected","key":"md:gate:spot:XYZUSDT","age_sec":120}
+```
+
+**Нормальный старт price_history:**
+```json
+{"event":"price_history_started","chunk_seconds":1200,"max_chunks":5,"batch_size":200,"batch_timeout_ms":100}
+{"event":"subscribed","pattern":"md:updates:*"}
+```
+
+**Ошибка в price_history (например, Redis недоступен):**
+```json
+{"event":"batch_error","error":"Connection refused","exc_info":true}
 ```
 
 ### Понимание Binance Spot latency
@@ -541,6 +606,47 @@ python3 run.py --only binance_spot binance_futures bybit_spot bybit_futures \
                stale_monitor latency_monitor
 ```
 
+### Сценарий 7: Проверка работы price_history изолированно
+
+```bash
+# 1. Убедиться, что коллекторы пишут данные
+python3 run.py --only binance_spot price_history --no-cleanup
+
+# 2. В другом терминале — наблюдать рост истории в реальном времени
+SLOT=$(($(date +%s) / 1200 % 5))
+watch -n 2 "redis-cli LLEN md:hist:binance:spot:BTCUSDT:$SLOT"
+
+# 3. Просмотр последних 5 записей
+watch -n 2 "redis-cli LRANGE md:hist:binance:spot:BTCUSDT:$SLOT -5 -1"
+```
+
+### Сценарий 8: Чтение истории из Python
+
+```python
+import time
+import redis
+
+r = redis.Redis(decode_responses=True)
+
+# Текущий слот
+slot = (int(time.time()) // 1200) % 5
+
+# Читаем всю текущую историю Binance Spot BTCUSDT
+entries = r.lrange(f"md:hist:binance:spot:BTCUSDT:{slot}", 0, -1)
+for e in entries[-5:]:  # последние 5
+    ts, bid, ask = e.split(":")
+    print(f"ts={ts}  bid={bid}  ask={ask}")
+
+# Читаем все 5 слотов (полная история ~100 мин)
+all_entries = []
+for s in range(5):
+    all_entries += r.lrange(f"md:hist:binance:spot:BTCUSDT:{s}", 0, -1)
+
+# Сортируем по времени (ts в начале строки)
+all_entries.sort(key=lambda x: int(x.split(":")[0]))
+print(f"Всего точек в истории: {len(all_entries)}")
+```
+
 ---
 
 ## 10. Диагностика проблем
@@ -586,6 +692,31 @@ redis-cli KEYS "md:*" | wc -l   # должно быть > 1000
 - `MIN_SPREAD_PCT` слишком высокий → попробуйте `MIN_SPREAD_PCT=0.1`
 - Данные устаревшие → сканер использует порог 5 минут, убедитесь что коллекторы работают
 - Мало символов в combination-файлах → обновите словари
+
+### price_history не пишет историю
+
+**Диагностика:**
+```bash
+# Ключи истории есть?
+redis-cli KEYS "md:hist:*" | wc -l   # ожидается > 0 через 30-60 с после старта
+
+# Процесс запущен?
+pgrep -af "price_history"
+
+# Лог
+tail -20 logs/price_history.log
+```
+
+**Причины:**
+- Нет события `subscribed` в логе → сервис не подключился к Redis → проверьте `redis-cli ping`
+- `DBSIZE` растёт, но `md:hist:*` пустой → коллекторы работают, но pub/sub не доходит → проверьте `redis-cli SUBSCRIBE md:updates:binance:spot` (должны приходить сообщения)
+- Частые `batch_error` → временная недоступность Redis → само восстановится, но будут "дыры" в истории
+
+**Проверка pub/sub вручную:**
+```bash
+# Должны приходить сообщения вида {"symbol":"BTCUSDT","key":"md:binance:spot:BTCUSDT"}
+redis-cli PSUBSCRIBE "md:updates:*"
+```
 
 ### signal_snapshot не создаёт файлы
 
@@ -844,4 +975,12 @@ kill -HUP $(pgrep -f "spread_scanner.py")
 for ex in binance bybit okx gate; do
   echo "$ex: $(redis-cli KEYS "md:$ex:*" | wc -l) keys"
 done
+
+# История цен — текущий чанк
+SLOT=$(($(date +%s) / 1200 % 5))
+redis-cli LLEN "md:hist:binance:spot:BTCUSDT:$SLOT"
+redis-cli LRANGE "md:hist:binance:spot:BTCUSDT:$SLOT" -5 -1
+
+# Всего ключей истории
+redis-cli KEYS "md:hist:*" | wc -l
 ```
