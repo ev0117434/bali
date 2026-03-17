@@ -8,7 +8,7 @@ REDIS SCHEMA
 
 Price data  (one Sorted Set per exchange / market / symbol / chunk):
 
-    Key:    prices:{exchange}:{market}:{symbol}:chunk:{chunk_num}
+    Key:    md:hist:{exchange}:{market}:{symbol}:{chunk_num}
     Type:   Sorted Set (ZSET)
     Score:  ts_received in milliseconds  (integer, Unix epoch ms)
     Member: JSON string — {"bid","ask","bid_qty","ask_qty","last",
@@ -18,10 +18,21 @@ Price data  (one Sorted Set per exchange / market / symbol / chunk):
 
 Config  (read-only metadata written at startup):
 
-    Key:    prices:config
+    Key:    md:hist:config
     Type:   Hash
     Fields: chunk_duration_sec, max_chunks, chunk_ttl_sec, sources,
             key_pattern, formula, active_formula, score_field, member_format
+
+Live price data (written by the 8 collectors, read-only for this writer):
+
+    Key:    md:{exchange}:{market}:{symbol}
+    Type:   Hash
+    Fields: bid, bid_qty, ask, ask_qty, last, ts_exchange, ts_received, ts_redis
+
+Pub/Sub channels (published by the 8 collectors, consumed here):
+
+    Channel: md:updates:{exchange}:{market}
+    Payload: {"symbol": "BTCUSDT", "key": "md:binance:spot:BTCUSDT"}
 
 ═══════════════════════════════════════════════════════════════════════════════
 HOW CHUNKS WORK
@@ -32,41 +43,43 @@ HOW CHUNKS WORK
 
     chunk_num  =  ts_received_ms  //  CHUNK_DURATION_MS
 
-Chunk N always covers the fixed window:
+Chunk N always covers the fixed time window:
     start_ms  =  N × 1 200 000
     end_ms    =  (N+1) × 1 200 000
 
-Rolling window keeps MAX_CHUNKS = 5 most recent chunks:
+Rolling window keeps MAX_CHUNKS = 5 most recent chunks (~100 min total):
     active chunks  =  range(current_chunk - 4,  current_chunk + 1)
-                   →  ~100 minutes of price history
 
 Transition logic:
-    • The writer computes chunk_num from each tick's ts_received.
-    • When ts_received crosses into a new 20-min window, the writer
-      simply starts writing to a new ZSET key.
-    • The old key (chunk N-5) expires automatically via TTL.
-    • No cronjob or explicit deletion is required.
+    • chunk_num is derived deterministically from each tick's ts_received.
+    • When ts_received crosses into a new 20-min window the writer
+      simply starts writing to a new ZSET key — no state machine needed.
+    • The key for chunk N-5 expires automatically via TTL.
+    • No cronjob, no explicit DEL, no background rotation task.
 
-Visual example (chunk numbers are arbitrary integers):
-    chunk 4217 │ prices:…:chunk:4217  score range [4217×1200000 … 4218×1200000)
-    chunk 4218 │ prices:…:chunk:4218
-    chunk 4219 │ prices:…:chunk:4219
-    chunk 4220 │ prices:…:chunk:4220
-    chunk 4221 │ prices:…:chunk:4221  ← current (being written)
-    chunk 4216 │ (expired, gone)
+Visual example (chunk_num values are real epoch-based integers):
+
+    md:hist:binance:spot:BTCUSDT:4217  TTL ~40 min  [T+0  … T+20 min)
+    md:hist:binance:spot:BTCUSDT:4218  TTL ~60 min  [T+20 … T+40 min)
+    md:hist:binance:spot:BTCUSDT:4219  TTL ~80 min  [T+40 … T+60 min)
+    md:hist:binance:spot:BTCUSDT:4220  TTL ~100 min [T+60 … T+80 min)
+    md:hist:binance:spot:BTCUSDT:4221  TTL ~120 min [T+80 … T+100 min)  ← current
+    (chunk 4216 already expired)
+
+    Same pattern for every exchange × market × symbol combination.
 
 ═══════════════════════════════════════════════════════════════════════════════
 HOW TO READ HISTORY  (for future scripts)
 ═══════════════════════════════════════════════════════════════════════════════
 
-Option A — import price_history_reader.py:
+Option A — import price_history_reader.py  (recommended):
 
     from price_history_reader import get_history, get_chunk_info
 
     history = await get_history(redis, "binance", "spot", "BTCUSDT")
-    info    = get_chunk_info()   # active chunks + time ranges
+    info    = get_chunk_info()   # active chunks + ISO time ranges, no Redis needed
 
-Option B — inline snippet:
+Option B — inline snippet (zero dependencies):
 
     import time, orjson
     import redis.asyncio as aioredis
@@ -80,7 +93,7 @@ Option B — inline snippet:
 
         pipe = redis.pipeline()
         for n in active:
-            pipe.zrange(f"prices:{exchange}:{market}:{symbol}:chunk:{n}",
+            pipe.zrange(f"md:hist:{exchange}:{market}:{symbol}:{n}",
                         0, -1, withscores=True)
         responses = await pipe.execute()
 
@@ -93,6 +106,15 @@ Option B — inline snippet:
                 entry["chunk_start_ms"] = start_ms
                 result.append(entry)
         return result   # sorted oldest → newest
+
+Option C — read md:hist:config from Redis (runtime self-discovery):
+
+    cfg = await redis.hgetall("md:hist:config")
+    # cfg["key_pattern"]    → "md:hist:{exchange}:{market}:{symbol}:{chunk_num}"
+    # cfg["formula"]        → "chunk_num = int(ts_received_ms / chunk_duration_ms)"
+    # cfg["chunk_duration_sec"] → "1200"
+    # cfg["max_chunks"]     → "5"
+    # cfg["sources"]        → "binance:spot,binance:futures,bybit:spot,..."
 """
 
 import asyncio
@@ -170,7 +192,7 @@ async def _write_tick(redis_client, exchange: str, market: str,
         ts_received = now_ms()
 
     n   = _chunk_num(ts_received)
-    key = f"prices:{exchange}:{market}:{symbol}:chunk:{n}"
+    key = f"md:hist:{exchange}:{market}:{symbol}:{n}"
 
     member = orjson.dumps({
         "bid":         data.get("bid",         ""),
@@ -215,7 +237,7 @@ async def _handle_message(redis_client, exchange: str, market: str,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# prices:config  — schema metadata for future scripts
+# md:hist:config  — schema metadata for future scripts
 # ─────────────────────────────────────────────────────────────────────────────
 async def _init_config(redis_client, log) -> None:
     cfg = {
@@ -223,7 +245,8 @@ async def _init_config(redis_client, log) -> None:
         "max_chunks":         str(MAX_CHUNKS),
         "chunk_ttl_sec":      str(CHUNK_TTL_SEC),
         "sources":            ",".join(f"{ex}:{mk}" for ex, mk in SOURCES),
-        "key_pattern":        "prices:{exchange}:{market}:{symbol}:chunk:{chunk_num}",
+        "key_pattern":        "md:hist:{exchange}:{market}:{symbol}:{chunk_num}",
+        "config_key":         "md:hist:config",
         "formula":            "chunk_num = int(ts_received_ms / chunk_duration_ms)",
         "active_formula":     "range(current_chunk - max_chunks + 1, current_chunk + 1)",
         "score_field":        "ts_received_ms",
@@ -234,8 +257,9 @@ async def _init_config(redis_client, log) -> None:
             f"TTL={CHUNK_TTL_SEC}s auto-expires old chunks"
         ),
     }
-    await redis_client.hset("prices:config", mapping=cfg)
-    log.info("prices_config_written",
+    await redis_client.hset("md:hist:config", mapping=cfg)
+    log.info("hist_config_written",
+             key="md:hist:config",
              chunk_duration_sec=CHUNK_DURATION_SEC,
              max_chunks=MAX_CHUNKS,
              total_history_min=MAX_CHUNKS * CHUNK_DURATION_SEC // 60)
