@@ -50,6 +50,7 @@ SCRIPTS = [
     "okx_futures",
     "gate_spot",
     "gate_futures",
+    "price_history",
     "stale_monitor",
     "latency_monitor",
     "spread_scanner",
@@ -69,6 +70,7 @@ COLORS = {
     "okx_futures":     "\033[37m",  # светло-серый
     "gate_spot":       "\033[32m",  # тёмно-зелёный
     "gate_futures":    "\033[36m",  # циан
+    "price_history":   "\033[34m",  # тёмно-синий
     "stale_monitor":   "\033[95m",  # фиолетовый
     "latency_monitor": "\033[91m",  # красный
     "spread_scanner":  "\033[33m",  # оранжевый
