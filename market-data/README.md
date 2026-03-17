@@ -28,6 +28,7 @@ market-data/
 ├── okx_futures.py      # OKX Swap (Futures) tickers → Redis
 ├── gate_spot.py        # Gate.io Spot book_ticker → Redis
 ├── gate_futures.py     # Gate.io Futures book_ticker → Redis
+├── price_history.py    # история цен по чанкам 20 мин → Redis Lists
 ├── stale_monitor.py    # обнаружение устаревших символов
 ├── latency_monitor.py  # мониторинг задержек pipeline
 ├── requirements.txt
@@ -71,6 +72,10 @@ cp .env.example .env
 | `SAMPLING_MAX_KEYS` | `200` | Ключей за один шаг SCAN (rolling cursor) |
 | `ANOMALY_WARN_MS` | `1000` | Порог WARNING для end-to-end задержки |
 | `ANOMALY_CRIT_MS` | `5000` | Порог CRITICAL для end-to-end задержки |
+| `HIST_CHUNK_SECONDS` | `1200` | Длина чанка истории (20 мин = 1200 с) |
+| `HIST_MAX_CHUNKS` | `5` | Число хранимых чанков (100 мин истории) |
+| `HIST_BATCH_SIZE` | `200` | Максимум обновлений за один батч |
+| `HIST_BATCH_TIMEOUT_MS` | `100` | Максимальное ожидание до флаша батча (мс) |
 
 ---
 
@@ -154,6 +159,29 @@ TTL ключа: `REDIS_KEY_TTL` секунд (по умолчанию 300). Кл
 ```
 md:updates:{exchange}:{market}   # новое обновление (payload: {"symbol": "...", "key": "..."})
 alerts:stale                     # от stale_monitor: {"ts":..., "stale_count":..., "symbols":[...]}
+```
+
+### Ключи истории цен (List)
+
+```
+md:hist:{exchange}:{market}:{symbol}:{slot}
+```
+
+Записываются сервисом `price_history.py`. Тип — Redis List. Каждый элемент: `"{ts_ms}:{bid}:{ask}"`.
+
+- `slot = (unix_time // 1200) % 5` — номер слота (0..4)
+- Активно 5 слотов × 20 минут = **100 минут истории**
+- При смене чанка старый слот удаляется (`DEL`) и начинает заполняться заново
+
+```bash
+# Текущий слот
+SLOT=$(($(date +%s) / 1200 % 5))
+
+# Все записи в текущем чанке для Binance Spot BTCUSDT
+redis-cli LRANGE md:hist:binance:spot:BTCUSDT:$SLOT 0 -1
+
+# Количество точек
+redis-cli LLEN md:hist:binance:spot:BTCUSDT:$SLOT
 ```
 
 ### Пример чтения
@@ -272,6 +300,10 @@ redis-cli TTL md:binance:spot:BTCUSDT
 | `latency_anomaly` | WARNING/CRITICAL | end-to-end задержка > порога |
 | `clock_skew_detected` | INFO | ts_received < ts_exchange (норма при расхождении часов) |
 | `graceful_shutdown` | INFO | Получен SIGTERM/SIGINT, завершение |
+| `price_history_started` | INFO | price_history запущен |
+| `subscribed` | INFO | psubscribe на md:updates:* успешен |
+| `chunk_rotated` | DEBUG | Начат новый чанк, старый слот удалён |
+| `batch_error` | ERROR | Ошибка батча в price_history |
 
 ### Правило: данные в логах не пишутся
 
@@ -300,6 +332,23 @@ redis-cli TTL md:binance:spot:BTCUSDT
   ]
 }
 ```
+
+### price_history.py
+
+Подписывается на все 8 каналов обновлений (`psubscribe md:updates:*`). Для каждого обновления читает текущую цену из Redis и добавляет запись в соответствующий чанк.
+
+**Скользящее окно (5 чанков по 20 минут):**
+
+```
+chunk_num = unix_time // 1200
+slot      = chunk_num % 5
+
+Чанк 6 → слот 1 → DEL md:hist:*:*:*:1 → начать писать чанк 6
+Чанк 7 → слот 2 → DEL md:hist:*:*:*:2 → начать писать чанк 7
+...
+```
+
+Батчи до 200 обновлений флашатся каждые 100 мс через pipeline HMGET + RPUSH/DEL.
 
 ### latency_monitor.py
 

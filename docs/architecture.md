@@ -25,11 +25,13 @@ HSET md:{exchange}:{market}:{symbol}  +  EXPIRE TTL  +  PUBLISH md:updates:*
    │
    ▼
 ┌──────────┐
-│  Redis   │  md:*:*:*  (Hash, TTL 300s)
+│  Redis   │  md:*:*:*       (Hash, TTL 300s)   ← текущая цена
+│          │  md:hist:*:*:*  (List, no TTL)     ← история 100 мин
 └────┬─────┘
      │
      ├──► stale_monitor    (SCAN + HGET, алерт если нет обновлений > 60s)
      ├──► latency_monitor  (SCAN + HMGET, считает e2e задержку)
+     ├──► price_history    (psubscribe md:updates:*, пишет чанки 20 мин)
      │
      └──► spread_scanner   (pipeline HMGET каждые 200ms)
                │
@@ -240,6 +242,26 @@ redis-cli subscribe ch:spread_signals
 | OKX | `BTC-USDT`, `BTC-USDT-SWAP` | `BTCUSDT` |
 | Gate.io | `BTC_USDT` | `BTCUSDT` |
 
+## История цен (price_history.py)
+
+```
+psubscribe md:updates:*
+       │
+       ▼  (exchange, market, symbol) → буфер 100мс / 200 шт
+pipeline HMGET  bid, ask, ts_redis
+       │
+       ▼
+chunk_num = unix_time // 1200
+slot      = chunk_num % 5
+
+Если chunk_num изменился:
+  DEL md:hist:{exchange}:{market}:{symbol}:{slot}   ← стираем старый чанк
+
+RPUSH md:hist:{exchange}:{market}:{symbol}:{slot}  "{ts}:{bid}:{ask}"
+```
+
+Всегда доступны **5 чанков по 20 минут** (100 минут истории) для каждого из 8 источников и каждого символа. Слоты 0–4 ротируются циклически.
+
 ## Отказоустойчивость
 
 ```
@@ -250,6 +272,7 @@ WS recv timeout       reconnect (нет данных 60 сек)
 Redis down            буфер deque(1000), запись при recovery
 Коллектор упал        run.py логирует, другие продолжают
 Символ stale          stale_monitor алерт через 60 сек
+price_history упал    hist-ключи остаются, при старте продолжается запись
 ```
 
 ## Мониторинг
@@ -261,4 +284,7 @@ stale_monitor ──SCAN──► Redis ──ts_redis──► delta > 60s? ─
 latency_monitor ─SCAN─► Redis ──ts fields──► stats(min/avg/p95) ──► log INFO latency_report
                                           └──► e2e > 1000ms? ──► log WARNING latency_anomaly
                                           └──► e2e > 5000ms? ──► log CRITICAL latency_anomaly
+
+price_history ─psubscribe─► md:updates:* ──► HMGET bid/ask ──► RPUSH md:hist:*:{slot}
+                                                             └──► DEL при смене чанка
 ```
